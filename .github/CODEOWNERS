@@ -1,0 +1,17 @@
+# Code owners for this repository.
+#
+# WHY THIS FILE EXISTS, beyond review routing: the branch ruleset requires an
+# approving review FROM A CODE OWNER. Because the only owner listed here is the
+# repository owner, nothing can merge into the default branch without their
+# explicit approval. A collaborator may open a pull request and push to it, but
+# cannot approve it into main.
+#
+# Note the limit of this on a personal repository. GitHub only supports
+# "restrict who can push to matching branches" on ORGANISATION repositories, so
+# the merge button itself cannot be limited to one person here. Add collaborators
+# with Read or Triage rather than Write and they cannot merge at all, which is the
+# airtight version of the same intent.
+#
+# Docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+*  @agusgonzaleznic
