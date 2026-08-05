@@ -1,0 +1,18 @@
+# Funding sources shown in the "Sponsor" button on the repository page.
+#
+# These keys take a bare username, not a full URL:
+#     ko_fi: <username> → https://ko-fi.com/<username>
+#
+# Docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+
+# Monthly or one-time, custom amounts.
+github: [agusgonzaleznic]
+
+# One-off: https://ko-fi.com/agusgonzaleznic
+#
+# A note for anyone checking this link: Ko-fi sits behind Cloudflare and answers
+# automated requests with a challenge page, so curl reports HTTP 403 for every
+# Ko-fi URL, real or invented. Verify it in a browser. A 403 proves nothing.
+ko_fi: agusgonzaleznic
+
+custom: ["https://agusgonzaleznic.com"]
