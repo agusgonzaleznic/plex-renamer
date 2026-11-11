@@ -6,10 +6,9 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 
-from . import classify, db, decisions, executor, lint, naming, scan
+from . import classify, db, decisions, executor, lint, naming, scan, undo
 from .planner import Planner
 
 CATEGORIES = ["Animated Movies", "Animated Series", "Anime Movies", "Anime Series",
@@ -105,6 +104,21 @@ def cmd_plan(args):
     return 1 if (problems or findings) else 0
 
 
+def run_ops(conn, run_id, label):
+    """Apply a journalled run. Ctrl-C stops it cleanly and says how to reverse it."""
+    db.set_run_status(conn, run_id, "applying")
+    try:
+        ok, failed = executor.apply_ops(conn, run_id, label=label)
+    except KeyboardInterrupt:
+        db.set_run_status(conn, run_id, "interrupted", finished=True)
+        print(f"\n\ninterrupted. What ran so far is in the journal; reverse it with:"
+              f"  python3 -m plexrenamer undo --run {run_id}")
+        raise SystemExit(130) from None
+    db.set_run_status(conn, run_id, "applied" if not failed else "applied-with-errors",
+                      finished=True)
+    return ok, failed
+
+
 def cmd_apply(args):
     units, plans, _, unmatched = build(args.root, args.categories, args.decisions)
     moves = all_moves(plans)
@@ -144,11 +158,8 @@ def cmd_apply(args):
     run_id = db.create_run(conn, args.root, args.categories, plan_hash(moves),
                            args.note)
     db.insert_ops(conn, run_id, ops)
-    db.set_run_status(conn, run_id, "applying")
     print(f"run id        : {run_id}\n")
-    ok, failed = executor.apply_ops(conn, run_id, label="renaming")
-    db.set_run_status(conn, run_id, "applied" if not failed else "applied-with-errors",
-                      finished=True)
+    ok, failed = run_ops(conn, run_id, "renaming")
     print(f"\ndone: {ok} operations succeeded, {failed} failed")
     good, bad, verify_problems = executor.verify_run(conn, run_id)
     print(f"verify: {good} confirmed on disk, {bad} mismatched")
@@ -166,21 +177,47 @@ def cmd_undo(args):
     conn = db.connect(args.db)
     run_id = args.run
     if run_id is None:
-        row = db.latest_run(conn)
-        if not row:
-            print("no runs recorded")
-            return 1
-        run_id = row["id"]
-    rows = [r for r in db.run_ops(conn, run_id) if r["status"] == "done"]
-    print(f"undoing run {run_id}: {len(rows)} operations")
+        run_id = db.newest_standing_run(conn)
+        if run_id is None:
+            print("nothing to undo")
+            return 0
+    run = db.get_run(conn, run_id)
+    if run is None:
+        print(f"no run {run_id}")
+        return 1
+    later = db.standing_runs_after(conn, run_id, run["root"])
+    if later and not args.force:
+        # a later run may have moved the same files again, and undoing this one
+        # first would leave both half reversed
+        print(f"run {run_id} is not the newest: run {', '.join(map(str, later))} "
+              f"came after it and still stand{'s' if len(later) == 1 else ''}.\n"
+              f"Undo the newest first (plain `undo` picks it), or pass --force.")
+        return 1
+    rows = [r for r in db.run_ops(conn, run_id) if r["status"] != "undone"]
+    expected = [r for r in rows if r["status"] in undo.EXPECTED]
+    print(f"undoing run {run_id}: {len(expected)} operations to reverse, "
+          f"{len(rows) - len(expected)} more to check against the disk")
     if args.dry_run:
-        for r in rows[:40]:
+        for r in expected[:40]:
             print(f"  {r['kind']}  {r['dst']} -> {r['src']}")
         return 0
-    ok, failed = executor.undo_run(conn, run_id)
+    try:
+        ok, failed = undo.undo_run(conn, run_id)
+    except undo.VolumeGone as exc:
+        if any(r["status"] == "undone" for r in db.run_ops(conn, run_id)):
+            db.set_run_status(conn, run_id, "partially-undone")
+        print(f"\nstopped: {exc}\nNothing is marked as undone that is not. "
+              f"Run undo again once the library is there.")
+        return 1
     db.set_run_status(conn, run_id, "undone" if not failed else "partially-undone",
                       finished=True)
     print(f"\nundone: {ok} reversed, {failed} failed")
+    if failed:
+        notes = [r for r in db.run_ops(conn, run_id)
+                 if r["status"] != "undone" and (r["error"] or "").startswith("undo:")]
+        for r in notes[:20]:
+            print(f"  {r['kind']} {r['dst'] or r['src']}: {r['error'][6:]}")
+        print("Rows that failed keep their state: fix the cause and run undo again.")
     return 0 if not failed else 1
 
 
@@ -200,7 +237,7 @@ def media_free_dirs(root, categories, protected):
             if any(os.path.join(current, d) not in out for d in dirs):
                 continue
             real = [f for f in files
-                    if not re.fullmatch(r"(?:\.DS_Store|Thumbs\.db)(?:-\d+)?", f)
+                    if not executor.METADATA_RE.fullmatch(f)
                     and not f.startswith("._")]
             if real:
                 continue
@@ -254,10 +291,7 @@ def cmd_prune(args):
     run_id = db.create_run(conn, args.root, args.categories, "prune",
                            args.note or "prune stale directory shells")
     db.insert_ops(conn, run_id, ops)
-    db.set_run_status(conn, run_id, "applying")
-    ok, failed = executor.apply_ops(conn, run_id, label="pruning")
-    db.set_run_status(conn, run_id, "applied" if not failed else
-                      "applied-with-errors", finished=True)
+    ok, failed = run_ops(conn, run_id, "pruning")
     print(f"\nremoved {ok} directory shells, {failed} failed")
     for row in db.run_ops(conn, run_id):
         if row["status"] == "failed":
@@ -311,7 +345,8 @@ def main(argv=None):
     p.add_argument("--note", default="")
     p.set_defaults(fn=cmd_apply)
     p = sub.add_parser("undo"); p.add_argument("--run", type=int)
-    p.add_argument("--dry-run", action="store_true"); p.set_defaults(fn=cmd_undo)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_undo)
     p = sub.add_parser("prune")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--note", default="")

@@ -1,5 +1,6 @@
 """End to end: build a fake library, plan it, apply it, undo it, and prove the
-tree comes back byte for byte identical."""
+tree comes back byte for byte identical. The fixture and the helpers here are
+shared with test_recovery.py and test_undo_safety.py."""
 
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plexrenamer import classify, db, decisions, executor, naming, scan  # noqa: E402
+from plexrenamer import classify, db, decisions, executor, naming, scan, undo  # noqa: E402
 from plexrenamer.planner import Planner  # noqa: E402
 
 FIXTURE = {
@@ -61,10 +62,30 @@ def contents(root):
     return out
 
 
-class RoundTrip(unittest.TestCase):
+def dirs(root):
+    """Every directory below root, to catch a stray or a missing folder after undo."""
+    return {os.path.relpath(os.path.join(base, name), root)
+            for base, names, _files in os.walk(root) for name in names}
+
+
+class SwapMove:
+    """The smallest thing build_ops accepts as a move."""
+
+    def __init__(self, src, dst, with_inode=False):
+        self.src, self.dst = src, dst
+        self.is_dir, self.size = False, 0
+        self.inode = os.lstat(src).st_ino if with_inode else 0
+        self.category, self.unit, self.reason = "", "", "swap"
+
+
+class LibraryCase(unittest.TestCase):
+    """A throwaway library on disk and a throwaway journal."""
+
+    EXTRA = {}
+
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="plexrenamer-test-")
-        for rel, payload in FIXTURE.items():
+        for rel, payload in {**FIXTURE, **self.EXTRA}.items():
             path = os.path.join(self.root, rel)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as fh:
@@ -89,6 +110,16 @@ class RoundTrip(unittest.TestCase):
         plans = [planner.plan_unit(u) for u in units]
         return units, [m for p in plans for m in p.moves]
 
+    def _journal(self):
+        """Plan the library and write the plan to a fresh journal."""
+        _units, moves = self._plan()
+        conn = db.connect(self.dbpath)
+        run_id = db.create_run(conn, self.root, CATS, "test")
+        db.insert_ops(conn, run_id, executor.build_ops(moves, self._boundaries()))
+        return conn, run_id
+
+
+class RoundTrip(LibraryCase):
     def test_plan_has_no_collisions(self):
         _units, moves = self._plan()
         self.assertEqual(executor.validate(moves), [])
@@ -115,7 +146,7 @@ class RoundTrip(unittest.TestCase):
         self.assertEqual(bad, 0, problems)
         self.assertGreater(good, 0)
 
-        ok, failed = executor.undo_run(conn, run_id, quiet=True)
+        ok, failed = undo.undo_run(conn, run_id, quiet=True)
         self.assertEqual(failed, 0, "undo reported failures")
         self.assertEqual(snapshot(self.root), before,
                          "undo did not restore the original tree exactly")
@@ -199,13 +230,8 @@ class RoundTrip(unittest.TestCase):
             with open(os.path.join(base, name), "w") as fh:
                 fh.write(name)
 
-        class M:
-            def __init__(self, src, dst):
-                self.src, self.dst = src, dst
-                self.is_dir, self.size, self.inode = False, 0, 0
-                self.category, self.unit, self.reason = "", "", "swap"
-        moves = [M(os.path.join(base, "a.mkv"), os.path.join(base, "b.mkv")),
-                 M(os.path.join(base, "b.mkv"), os.path.join(base, "a.mkv"))]
+        moves = [SwapMove(os.path.join(base, "a.mkv"), os.path.join(base, "b.mkv")),
+                 SwapMove(os.path.join(base, "b.mkv"), os.path.join(base, "a.mkv"))]
         ops = executor.build_ops(moves, [base])
         self.assertEqual(sum(1 for o in ops if executor.TEMP_SUFFIX in (o.dst or "")), 1)
         conn = db.connect(self.dbpath)
@@ -217,6 +243,8 @@ class RoundTrip(unittest.TestCase):
             self.assertEqual(fh.read(), "b.mkv")
         with open(os.path.join(base, "b.mkv")) as fh:
             self.assertEqual(fh.read(), "a.mkv")
+        _good, bad, problems = executor.verify_run(conn, run_id)
+        self.assertEqual(bad, 0, problems)
 
 
 class NamingRules(unittest.TestCase):

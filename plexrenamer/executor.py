@@ -1,12 +1,16 @@
-"""Apply and reverse a plan.
+"""Apply a plan. Reversing one is in undo.py.
 
 Ordering rules:
   1. every destination directory is created first (recorded, so undo can remove it)
   2. file moves run in an order that never overwrites a file that still has to move
   3. genuine cycles are broken with a temporary name, recorded as two moves
   4. directories we emptied are removed last, deepest first, and recreated on undo
+  5. the journal is written ahead of the disk: the whole plan is in it before the
+     first op, and an op is marked "started" and committed before it runs, then
+     "done" or "failed"
 
-Nothing is ever deleted except a directory this tool itself emptied.
+Nothing in the library is ever deleted. The only things removed are directories
+this tool emptied or created.
 """
 
 from __future__ import annotations
@@ -22,6 +26,9 @@ from dataclasses import dataclass
 from . import db
 
 TEMP_SUFFIX = ".plexrenamer-tmp"
+# Folder metadata the OS writes by itself. It never counts as content, and it is
+# never deleted: when its folder has to go it moves up to the parent.
+METADATA_RE = re.compile(r"(?:\.DS_Store|Thumbs\.db)(?:-\d+)?")
 
 
 @dataclass
@@ -125,7 +132,7 @@ def build_ops(moves, boundaries=(), extra_prunes=()):
     for tmp, victim in tail:
         seq += 1
         ops.append(Op(seq, "rename", tmp, victim.dst, victim.is_dir, victim.size,
-                      0, victim.category, victim.reason))
+                      victim.inode, victim.category, victim.reason))
 
     prunable = _prunable_dirs(moves, {o.dst for o in ops if o.kind == "mkdir"},
                               boundaries)
@@ -249,26 +256,95 @@ def fmt_duration(seconds: float) -> str:
 
 
 def apply_ops(conn, run_id: int, label: str = "apply", quiet: bool = False):
+    """Run every pending op of a run.
+
+    Each row is marked "started" and committed before its operation touches the
+    disk, then marked "done" or "failed" and committed again. A run that is cut
+    off (Ctrl-C, a kill, a crash) leaves only the rows that were in flight as
+    "started", and undo settles those by looking at the disk.
+    """
     rows = db.run_ops(conn, run_id)
     todo = [r for r in rows if r["status"] == "pending"]
     bar = None if quiet else Progress(len(todo), label)
     ok = failed = 0
     for row in todo:
+        db.mark_op(conn, row["id"], "started")
+        conn.commit()
         try:
+            if row["kind"] == "rmdir":
+                _lift_metadata(conn, run_id, row["src"])
             _do(row["kind"], row["src"], row["dst"], row["inode"])
             db.mark_op(conn, row["id"], "done")
             ok += 1
         except Exception as exc:                      # noqa: BLE001
-            db.mark_op(conn, row["id"], "failed", f"{type(exc).__name__}: {exc}")
-            failed += 1
-        if ok % 200 == 0:
-            conn.commit()
+            if row["kind"] == "rename" and _took_effect(row):
+                # a network share can report an error for a rename that went
+                # through, when the reply is lost
+                db.mark_op(conn, row["id"], "done",
+                           f"took effect although it reported {type(exc).__name__}: {exc}")
+                ok += 1
+            else:
+                db.mark_op(conn, row["id"], "failed", f"{type(exc).__name__}: {exc}")
+                failed += 1
+        conn.commit()
         if bar:
             bar.step(1, os.path.basename(row["dst"] or row["src"] or ""))
-    conn.commit()
     if bar:
         bar.close()
     return ok, failed
+
+
+def holds(path: str, inode: int) -> bool:
+    """True when path exists and is the very file or folder with that inode."""
+    try:
+        return os.lstat(path).st_ino == inode
+    except OSError:
+        return False
+
+
+def _took_effect(row) -> bool:
+    """A rename is proven done when its file is at the destination and gone from
+    the source. Without a recorded inode nothing is proven."""
+    return bool(row["inode"]) and not os.path.lexists(row["src"]) \
+        and holds(row["dst"], row["inode"])
+
+
+def free_name(parent: str, name: str) -> str:
+    """A metadata name not yet taken in parent: .DS_Store, .DS_Store-1, ..."""
+    base = re.sub(r"-\d+$", "", name)
+    target, n = os.path.join(parent, base), 0
+    while os.path.lexists(target):
+        n += 1
+        target = os.path.join(parent, f"{base}-{n}")
+    return target
+
+
+def _lift_metadata(conn, run_id: int, directory: str) -> None:
+    """Get folder metadata out of the way of an rmdir without deleting it.
+
+    A `.DS_Store` or `Thumbs.db` is all that stops an emptied directory from
+    being removed. It moves up to the parent, and that move goes into the journal
+    as a rename of its own, written before it happens, so undo brings it back.
+    Nothing moves when the directory holds anything else: it stays as it is and
+    the rmdir reports that it was not empty.
+    """
+    if not os.path.isdir(directory):
+        return
+    names = sorted(os.listdir(directory))
+    if not names or not all(METADATA_RE.fullmatch(name) for name in names):
+        return
+    parent = os.path.dirname(directory)
+    for name in names:
+        src = os.path.join(directory, name)
+        dst = free_name(parent, name)
+        info = os.lstat(src)
+        op_id = db.append_op(conn, run_id, "rename", src, dst, size=info.st_size,
+                             inode=info.st_ino, status="started",
+                             reason="folder metadata moved up, its folder is removed")
+        conn.commit()
+        _do("rename", src, dst, info.st_ino)
+        db.mark_op(conn, op_id, "done")
+        conn.commit()
 
 
 def _do(kind: str, src, dst, inode):
@@ -278,15 +354,6 @@ def _do(kind: str, src, dst, inode):
     if kind == "rmdir":
         if not os.path.isdir(src):
             return
-        leftovers = [e for e in os.listdir(src)
-                     if re.fullmatch(r"(?:\.DS_Store|Thumbs\.db)(?:-\d+)?", e)]
-        for name in leftovers:
-            target = os.path.join(os.path.dirname(src), name)
-            n = 0
-            while os.path.lexists(target):
-                n += 1
-                target = os.path.join(os.path.dirname(src), f"{name}-{n}")
-            os.rename(os.path.join(src, name), target)
         try:
             os.rmdir(src)
         except OSError as exc:
@@ -306,49 +373,25 @@ def _do(kind: str, src, dst, inode):
     os.rename(src, dst)
 
 
-def undo_run(conn, run_id: int, quiet: bool = False):
-    rows = [r for r in db.run_ops(conn, run_id, reverse=True) if r["status"] == "done"]
-    bar = None if quiet else Progress(len(rows), "undo")
-    ok = failed = 0
-    for row in rows:
-        try:
-            if row["kind"] == "rename":
-                if not os.path.lexists(row["dst"]):
-                    raise FileNotFoundError(row["dst"])
-                if os.path.lexists(row["src"]):
-                    raise PlanError(f"original path reoccupied: {row['src']}")
-                os.makedirs(os.path.dirname(row["src"]), exist_ok=True)
-                os.rename(row["dst"], row["src"])
-            elif row["kind"] == "mkdir":
-                if os.path.isdir(row["dst"]) and not [
-                        e for e in os.listdir(row["dst"]) if e != ".DS_Store"]:
-                    shutil.rmtree(row["dst"], ignore_errors=True)
-            elif row["kind"] == "rmdir":
-                os.makedirs(row["src"], exist_ok=True)
-            db.mark_op(conn, row["id"], "undone", undone=True)
-            ok += 1
-        except Exception as exc:                      # noqa: BLE001
-            db.mark_op(conn, row["id"], "undo-failed", f"{type(exc).__name__}: {exc}",
-                       undone=True)
-            failed += 1
-        if ok % 200 == 0:
-            conn.commit()
-        if bar:
-            bar.step(1)
-    conn.commit()
-    if bar:
-        bar.close()
-    return ok, failed
-
-
 def verify_run(conn, run_id: int):
     """Confirm on-disk reality matches the journal."""
     good = bad = 0
     problems = []
-    for row in db.run_ops(conn, run_id):
+    rows = db.run_ops(conn, run_id)
+    # A file can move twice in one run: a swap staged through a temporary name,
+    # or folder metadata lifted out of two nested folders. Its first destination
+    # is then the source of a later move, and that later row is the one to check.
+    moved_on = {}
+    for row in rows:
+        if row["status"] == "done" and row["kind"] == "rename":
+            moved_on[row["src"]] = max(moved_on.get(row["src"], 0), row["seq"])
+    for row in rows:
         if row["status"] != "done":
             continue
         if row["kind"] == "rename":
+            if moved_on.get(row["dst"], 0) > row["seq"]:
+                good += 1
+                continue
             if not os.path.lexists(row["dst"]):
                 problems.append(f"missing destination: {row['dst']}")
                 bad += 1

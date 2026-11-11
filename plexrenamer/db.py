@@ -89,6 +89,51 @@ def insert_ops(conn, run_id: int, ops) -> None:
     conn.commit()
 
 
+def append_op(conn, run_id: int, kind: str, src, dst, *, size: int = 0, inode: int = 0,
+              reason: str = "", status: str = "pending") -> int:
+    """Add one op behind the planned ones, for a move that is only known at run time.
+
+    It gets the highest seq of its run, so undo reverses it before anything that
+    was planned. The caller commits.
+    """
+    seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM op WHERE run_id=?",
+                       (run_id,)).fetchone()[0]
+    cur = conn.execute(
+        "INSERT INTO op(run_id, seq, kind, src, dst, is_dir, size, inode, category,"
+        " reason, status, applied_at) VALUES (?,?,?,?,?,0,?,?,'',?,?,?)",
+        (run_id, seq, kind, src, dst, size, inode, reason, status, utcnow()),
+    )
+    return cur.lastrowid
+
+
+def note_op(conn, op_id: int, note: str) -> None:
+    """Record why an op could not be undone. Its status stays, so the next undo
+    tries it again."""
+    conn.execute("UPDATE op SET error=?, undone_at=? WHERE id=?",
+                 (note, utcnow(), op_id))
+
+
+def get_run(conn, run_id: int):
+    return conn.execute("SELECT * FROM run WHERE id=?", (run_id,)).fetchone()
+
+
+# A run still stands when it may have changed the disk and is not fully undone.
+_STANDING = "status NOT IN ('undone', 'planned')"
+
+
+def newest_standing_run(conn):
+    row = conn.execute(
+        f"SELECT id FROM run WHERE {_STANDING} ORDER BY id DESC LIMIT 1").fetchone()
+    return row["id"] if row else None
+
+
+def standing_runs_after(conn, run_id: int, root: str):
+    """Later runs on the same library that are not undone, newest first."""
+    return [row["id"] for row in conn.execute(
+        f"SELECT id FROM run WHERE id > ? AND root = ? AND {_STANDING} ORDER BY id DESC",
+        (run_id, root))]
+
+
 def set_run_status(conn, run_id: int, status: str, finished: bool = False) -> None:
     if finished:
         conn.execute("UPDATE run SET status=?, finished_at=? WHERE id=?",

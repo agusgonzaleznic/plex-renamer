@@ -10,24 +10,38 @@ section; the code does not read it. Of its 260 rules, 155 are marked
 
 ## Guarantees
 
-- **Nothing is deleted.** Every operation is `os.rename`. The only removals are of
-  directories this tool itself emptied, and `undo` recreates them.
-- **Every run is reversible.** Each operation is written to SQLite before it runs
-  and updated after, with the source inode recorded. `undo` replays the journal
-  backwards and refuses to move a file whose original path has been reoccupied.
-- **Two known exceptions to the above.** Folder metadata: before the tool tries
-  to remove a directory it has emptied, a `.DS_Store` or `Thumbs.db` inside it is
-  moved up to the parent folder (as `.DS_Store-1` and so on when the name is
-  taken) without a journal entry, so `undo` recreates the directory but leaves
-  that file in the parent; and when `undo` removes a directory the tool created,
-  a `.DS_Store` that has appeared inside it since is removed with it. Interrupted
-  runs: the journal marks are committed in batches of 200, so when `apply` is
-  stopped part-way (Ctrl-C, a kill, a crash) the operations finished since the
-  last batch are on disk but not marked as done, and `undo` skips them. Their
-  source and destination paths remain in the journal.
+- **Nothing in the library is deleted.** The library is changed with `os.rename`,
+  `os.makedirs` and `os.rmdir` only. The only things removed are directories: ones
+  the tool emptied, which `undo` recreates, and ones a run created, once they are
+  empty again. A folder that appears at a planned path between `plan` and `apply`
+  counts as created by the run. Folder metadata (`.DS_Store`, `Thumbs.db`) is not
+  deleted either: when its folder has to go, it moves up to the parent (as
+  `.DS_Store-1` and so on when the name is taken).
+- **The one thing the tool deletes is its own.** To estimate the running time,
+  `apply` writes 60 scratch files to `<root>/.plexrenamer-benchmark`, times
+  renaming them and removes them and that folder again, also on `--dry-run`.
+  `--rate` skips it.
+- **Every run can be undone, also one that was cut off.** The whole plan is in
+  the SQLite journal before the first operation, each rename with the inode of
+  its source, and each operation is marked as started before it runs and as done
+  after. `undo` goes through the journal backwards and settles every row by where
+  its file is now. That way it also reverses an operation that was in flight when
+  the run stopped (Ctrl-C, a kill, a crash), one whose mark never reached the
+  journal, and a rename that went through although the share reported an error.
+  When `apply` or `prune` moves folder metadata, that move is in the journal too.
+- **Undo does not guess and does not give up.** It never moves a file onto an
+  original path that has been taken, never moves a file that is not the one the
+  run moved, and keeps a folder a run created while anything else is in it. It
+  stops when the library is not mounted. A row it could not undo keeps its state
+  and is tried again by the next `undo`, which is also how an `undo` that was
+  itself cut off is finished. Runs are undone newest first: plain `undo` picks the
+  newest run that still stands, and `undo --run N` refuses while a later one does,
+  unless `--force` is given.
 - **The plan is validated before anything moves.** Two sources mapping to one
   destination, a vanished source, or an already-occupied destination all abort the
   run rather than overwrite.
+- **One writer at a time.** The checks look at a path and then rename it, and
+  nothing locks the library. Run the tool while nothing else writes to it.
 - **Pruning cannot escape the library.** Empty-directory removal is bounded to the
   interior of the category directories, so it can never reach the volume root.
 - **Renames are ordered.** A move whose destination is still occupied by another
@@ -40,7 +54,7 @@ python3 -m plexrenamer plan                       # build and validate, write re
 python3 -m plexrenamer apply --dry-run            # op count, measured rate, ETA only
 python3 -m plexrenamer apply                      # run it, with a progress bar
 python3 -m plexrenamer verify                     # re-check the last run against disk
-python3 -m plexrenamer undo                       # reverse the last run
+python3 -m plexrenamer undo                       # reverse the newest run that stands
 python3 -m plexrenamer undo --run 3               # reverse a specific run
 python3 -m plexrenamer status                     # list runs and their op counts
 python3 -m plexrenamer prune --dry-run            # find shells emptied by a run
@@ -60,6 +74,7 @@ point at a different override directory.
 4. **planner** turns each title into concrete file moves.
 5. **executor** validates, expands into `mkdir` / `rename` / `rmdir` operations,
    journals them, runs them with a progress bar, then verifies inodes on disk.
+6. **undo** settles every journal row against the disk, newest first.
 
 ## Naming applied
 
@@ -97,7 +112,12 @@ python3 -m unittest discover -s tests -v
 
 Covers the naming patterns, plan validation, cycle breaking, the apply/undo
 round trip byte for byte, and an explicit assertion that no file content ever
-disappears from the volume.
+disappears from the volume. The recovery tests cut `apply` and `undo` off at
+every single step, before and after the step touches the disk, and check that
+the tree comes back exactly, folder metadata included. The safety tests put
+somebody else's files in the way, take the library away, lose a reply from the
+share and undo runs out of order, and check that no foreign file is touched and
+that every row that could not be undone is still there for the next try.
 
 ## Pruning shells left behind by a rename
 
@@ -109,5 +129,6 @@ python3 -m plexrenamer prune               # remove them, journalled
 `prune` removes directories that hold no media anywhere below them, but only
 those this tool actually emptied, established from the journal rather than
 guessed. A folder that was already empty before the tool ever ran is reported
-and left alone. Any Finder metadata inside a pruned directory is moved to the
-parent rather than deleted, and `undo` recreates the directory.
+and left alone. Any folder metadata inside a pruned directory is moved to the
+parent rather than deleted, and `undo` recreates the directory and puts that
+file back.
