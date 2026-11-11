@@ -15,7 +15,7 @@ section; the code does not read it. Of its 260 rules, 155 are marked
 - **Every run is reversible.** Each operation is written to SQLite before it runs
   and updated after, with the source inode recorded. `undo` replays the journal
   backwards and refuses to move a file whose original path has been reoccupied.
-- **Two known exceptions to the above.** Folder metadata: before the tool tries
+- **Three known exceptions to the above.** Folder metadata: before the tool tries
   to remove a directory it has emptied, a `.DS_Store` or `Thumbs.db` inside it is
   moved up to the parent folder (as `.DS_Store-1` and so on when the name is
   taken) without a journal entry, so `undo` recreates the directory but leaves
@@ -24,7 +24,12 @@ section; the code does not read it. Of its 260 rules, 155 are marked
   runs: the journal marks are committed in batches of 200, so when `apply` is
   stopped part-way (Ctrl-C, a kill, a crash) the operations finished since the
   last batch are on disk but not marked as done, and `undo` skips them. Their
-  source and destination paths remain in the journal.
+  source and destination paths remain in the journal. Failed rows: a row that
+  `undo` cannot reverse is marked as failed and never tried again, and the next
+  `undo` then reports the run as undone. With the library not mounted every
+  rename fails that way, the folders the run created are written off as gone,
+  and the folders it removed are recreated wherever that path can be written.
+  Run `undo` only with the library mounted.
 - **The plan is validated before anything moves.** Two sources mapping to one
   destination, a vanished source, or an already-occupied destination all abort the
   run rather than overwrite.
