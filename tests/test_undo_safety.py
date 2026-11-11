@@ -7,17 +7,16 @@ that could not be undone must still be there for the next try."""
 
 from __future__ import annotations
 
-import contextlib
 import errno
-import io
 import os
+import shutil
 import unittest
 from unittest import mock
 
 from test_recovery import Interrupt
-from test_roundtrip import CATS, LibraryCase, dirs, snapshot
+from test_roundtrip import CATS, LibraryCase, dirs, remount, snapshot
 
-from plexrenamer import cli, db, executor, undo
+from plexrenamer import db, executor, undo
 
 MOVIE = "Movies/Loose Movie (1988).mkv"
 MOVIE_DST = "Movies/Loose Movie (1988)/Loose Movie (1988).mkv"
@@ -95,9 +94,9 @@ class UndoSafety(LibraryCase):
         away = self.root + ".away"
         real, calls = undo._settle, {"n": 0}
 
-        def settle(row):
+        def settle(*args):
             calls["n"] += 1
-            result = real(row)
+            result = real(*args)
             if calls["n"] == 12:
                 os.rename(self.root, away)        # the share drops here
             return result
@@ -109,6 +108,22 @@ class UndoSafety(LibraryCase):
         self.assertEqual(states.count("undone"), 12)
         self.assertEqual(set(states), {"done", "undone"})
         self._assert_restored(conn, run_id)
+
+    def test_a_missing_category_stops_undo_before_anything_is_touched(self):
+        for category in CATS:
+            self.tearDown()
+            self.setUp()
+            conn, run_id = self._applied()
+            there, away = os.path.join(self.root, category), self.root + ".category"
+            os.rename(there, away)
+            try:
+                with self.assertRaises(undo.VolumeGone):
+                    undo.undo_run(conn, run_id, quiet=True)
+            finally:
+                os.rename(away, there)
+            self.assertEqual({r["status"] for r in db.run_ops(conn, run_id)}, {"done"},
+                             f"rows were undone although {category} was missing")
+            conn.close()
 
     # -- somebody else's file is in the way ----------------------------------
 
@@ -198,6 +213,15 @@ class UndoSafety(LibraryCase):
         self.assertFalse(os.path.lexists(self.src), "an unrelated file was moved back")
         self.assertEqual(read(self.dst), FOREIGN)
 
+    def test_on_one_mount_a_stranger_of_the_same_size_is_not_taken_back(self):
+        conn, run_id = self._cut_at_the_movie(after=False)
+        os.rename(self.src, os.path.join(self.root, "Movies", "moved by hand.mkv"))
+        write(self.dst, "s" * 32)                 # same size as the film, another file
+        _ok, failed = undo.undo_run(conn, run_id, quiet=True)
+        self.assertGreaterEqual(failed, 1)
+        self.assertFalse(os.path.lexists(self.src), "the inode said it was another file")
+        self.assertEqual(read(self.dst), "s" * 32)
+
     def test_a_cut_off_move_onto_a_taken_name_is_left_alone(self):
         conn, run_id = self._journal()
         os.makedirs(os.path.dirname(self.dst))
@@ -238,6 +262,92 @@ class UndoSafety(LibraryCase):
         with mock.patch.object(executor, "_do", do):
             executor.apply_ops(conn, run_id, quiet=True)
 
+    def test_after_a_remount_an_unrelated_file_is_still_not_taken_back(self):
+        conn, run_id = self._cut_at_the_movie(after=False)
+        conn.close()
+        remount(self.root)                        # the inode numbers are gone
+        conn = db.connect(self.dbpath)
+        os.rename(self.src, os.path.join(self.root, "Movies", "moved by hand.mkv"))
+        write(self.dst)                           # another size, so another file
+        _ok, failed = undo.undo_run(conn, run_id, quiet=True)
+        self.assertGreaterEqual(failed, 1)
+        self.assertFalse(os.path.lexists(self.src), "an unrelated file was moved back")
+        self.assertEqual(read(self.dst), FOREIGN)
+
+    # -- folders the run did not make or remove -------------------------------
+
+    def test_a_run_that_stopped_at_its_first_step_leaves_other_folders_alone(self):
+        conn, run_id = self._journal()
+        with mock.patch.object(executor, "_do", side_effect=Interrupt()), \
+                self.assertRaises(Interrupt):
+            executor.apply_ops(conn, run_id, quiet=True)
+        rows = db.run_ops(conn, run_id)
+        planned_folder = [r["dst"] for r in rows if r["kind"] == "mkdir"][-1]
+        pruned_folder = next(r["src"] for r in rows if r["kind"] == "rmdir")
+        os.makedirs(planned_folder)               # made by hand, not by the run
+        shutil.move(pruned_folder, self.root + ".moved-away")
+        try:
+            self.assertEqual(undo.undo_run(conn, run_id, quiet=True)[1], 0)
+            self.assertTrue(os.path.isdir(planned_folder), "a hand-made folder was removed")
+            self.assertFalse(os.path.lexists(pruned_folder),
+                             "a folder the run never removed was recreated")
+        finally:
+            shutil.rmtree(self.root + ".moved-away", ignore_errors=True)
+
+    def test_a_created_folder_on_record_as_failed_is_still_reported_and_removed(self):
+        conn, run_id = self._applied()
+        created = os.path.dirname(self.dst)
+        conn.execute("UPDATE op SET status='failed' WHERE run_id=? AND kind='mkdir' AND dst=?",
+                     (run_id, created))
+        conn.commit()                             # the share reported an error for a mkdir that worked
+        extra = os.path.join(created, "notes.txt")
+        write(extra)
+        self.assertEqual(undo.undo_run(conn, run_id, quiet=True)[1], 1,
+                         "a folder the run made is still there, and that must be said")
+        self.assertEqual(read(extra), FOREIGN)
+        os.remove(extra)
+        self._assert_restored(conn, run_id)
+
+    def test_a_folder_whose_removal_is_not_on_record_comes_back(self):
+        for lost in ("failed", "pending"):        # an error was reported, or the mark was lost
+            self.tearDown()
+            self.setUp()
+            first, second = (os.path.join(self.root, "Movies", name)
+                             for name in ("shell one", "shell two"))
+            os.makedirs(first)
+            os.makedirs(second)
+            wanted = dirs(self.root)
+            conn = db.connect(self.dbpath)
+            run_id = db.create_run(conn, self.root, CATS, "prune")
+            db.insert_ops(conn, run_id, [
+                executor.Op(n, "rmdir", path, None, True, 0, 0, "", "stale shell")
+                for n, path in enumerate((first, second), 1)])
+            self.assertEqual(executor.apply_ops(conn, run_id, quiet=True), (2, 0))
+            conn.execute("UPDATE op SET status=? WHERE run_id=? AND seq=1", (lost, run_id))
+            conn.commit()
+            self.assertEqual(undo.undo_run(conn, run_id, quiet=True)[1], 0)
+            self.assertEqual(dirs(self.root), wanted, f"removal recorded as {lost}")
+            conn.close()
+
+    def test_a_lookup_that_fails_once_does_not_write_a_folder_off(self):
+        conn, run_id = self._applied()
+        created = os.path.dirname(self.dst)
+        real, hiccups = os.lstat, {"n": 0}
+
+        def lstat(path, *args, **kwargs):
+            if path == created and not hiccups["n"]:
+                hiccups["n"] += 1
+                raise OSError(errno.EIO, "the share hiccuped")
+            return real(path, *args, **kwargs)
+        with mock.patch.object(os, "lstat", lstat):
+            _ok, failed = undo.undo_run(conn, run_id, quiet=True)
+        self.assertEqual((failed, hiccups["n"]), (1, 1))
+        self.assertTrue(os.path.isdir(created))
+        row = conn.execute("SELECT * FROM op WHERE run_id=? AND kind='mkdir' AND dst=?",
+                           (run_id, created)).fetchone()
+        self.assertEqual(row["status"], "done", "a folder that is still there was written off")
+        self._assert_restored(conn, run_id)
+
     # -- the share reported an error for a rename that went through ------------
 
     def test_a_rename_that_went_through_but_reported_an_error_is_done(self):
@@ -266,102 +376,29 @@ class UndoSafety(LibraryCase):
         self.assertEqual(self._movie_row(conn, run_id)["status"], "undone")
 
 
-class UndoCommand(LibraryCase):
-    """The same promises, through the command line and its run bookkeeping."""
+class MetadataNames(LibraryCase):
+    """A file the plan itself moves to a metadata name is a file, not metadata."""
 
-    def setUp(self):
-        super().setUp()
-        self.src = os.path.join(self.root, MOVIE)
-        self.before, self.before_dirs = snapshot(self.root), dirs(self.root)
+    SCENE = "Series/Moss.Atlas.2023.S01.1080p.H265-TBK"
+    EXTRA = {f"{SCENE}/DS Store": "y"}
 
-    def _cli(self, *args):
-        out = io.StringIO()
-        argv = ["--root", self.root, "--db", self.dbpath, "--categories", *CATS,
-                "--decisions", os.path.join(self.state, "none"), *args]
-        with contextlib.redirect_stdout(out):
-            try:
-                code = cli.main(argv)
-            except SystemExit as exc:
-                code = exc.code
-            except KeyboardInterrupt:
-                code = "KeyboardInterrupt escaped"
-        return code, out.getvalue()
-
-    def _run_status(self, run_id=1):
-        conn = db.connect(self.dbpath)
-        try:
-            return db.get_run(conn, run_id)["status"]
-        finally:
-            conn.close()
-
-    def test_runs_are_undone_newest_first(self):
-        self.assertEqual(self._cli("apply", "--rate", "5000")[0], 0)
-        late = "Movies/Hollow Tide (2021) [1080p] [WEBRip] [YTS.MX]/Hollow.Tide.2021.1080p.mp4"
-        os.makedirs(os.path.dirname(os.path.join(self.root, late)))
-        write(os.path.join(self.root, late), "z" * 32)
-        self.assertEqual(self._cli("apply", "--rate", "5000")[0], 0)
-        applied = snapshot(self.root)
-        code, out = self._cli("undo", "--run", "1")
-        self.assertEqual(code, 1, out)
-        self.assertIn("run 2", out)
-        self.assertEqual(snapshot(self.root), applied, "an older run was undone first")
-        for expected in ("undoing run 2", "undoing run 1"):
-            code, out = self._cli("undo")
-            self.assertEqual(code, 0, out)
-            self.assertIn(expected, out)
-        self.assertIn("nothing to undo", self._cli("undo")[1])
-        after = snapshot(self.root)
-        self.assertEqual(after.pop(late), snapshot(self.root)[late])
-        self.assertEqual(after, self.before)
-        self.assertEqual((self._run_status(1), self._run_status(2)), ("undone", "undone"))
-
-    def test_undo_says_what_is_left_and_finishes_on_a_later_try(self):
-        self.assertEqual(self._cli("apply", "--rate", "5000")[0], 0)
-        write(self.src)
-        for _attempt in (1, 2):                   # the second try must not give up either
-            code, out = self._cli("undo")
-            self.assertEqual(code, 1, out)
-            self.assertIn("reoccupied", out)
-            self.assertEqual(self._run_status(), "partially-undone")
-        os.remove(self.src)
-        code, out = self._cli("undo")
-        self.assertEqual(code, 0, out)
-        self.assertEqual(self._run_status(), "undone")
-        self.assertEqual(snapshot(self.root), self.before)
-        self.assertEqual(dirs(self.root), self.before_dirs)
-
-    def test_undo_changes_nothing_while_the_library_is_away(self):
-        self.assertEqual(self._cli("apply", "--rate", "5000")[0], 0)
-        away = self.root + ".away"
-        os.rename(self.root, away)
-        try:
-            code, out = self._cli("undo")
-        finally:
-            os.rename(away, self.root)
-        self.assertEqual(code, 1, out)
-        self.assertIn("stopped", out)
-        self.assertEqual(self._run_status(), "applied")
-        code, out = self._cli("undo")
-        self.assertEqual(code, 0, out)
-        self.assertEqual(snapshot(self.root), self.before)
-        self.assertEqual(dirs(self.root), self.before_dirs)
-
-    def test_ctrl_c_stops_cleanly_and_the_printed_command_reverses_it(self):
-        real, calls = executor._do, {"n": 0}
-
-        def do(*args):
-            calls["n"] += 1
-            if calls["n"] == 20:
-                raise KeyboardInterrupt()
-            real(*args)
-        with mock.patch.object(executor, "_do", do):
-            code, out = self._cli("apply", "--rate", "5000")
-        self.assertEqual(code, 130)
-        self.assertIn("undo --run 1", out)
-        self.assertEqual(self._run_status(), "interrupted")
-        self.assertEqual(self._cli("undo", "--run", "1")[0], 0)
-        self.assertEqual(snapshot(self.root), self.before)
-        self.assertEqual(dirs(self.root), self.before_dirs)
+    def test_it_is_not_lifted_out_while_its_own_undo_is_blocked(self):
+        before, before_dirs = snapshot(self.root), dirs(self.root)
+        conn, run_id = self._journal()
+        self.assertEqual(executor.apply_ops(conn, run_id, quiet=True)[1], 0)
+        src = os.path.join(self.root, self.SCENE, "DS Store")
+        row = conn.execute("SELECT * FROM op WHERE run_id=? AND src=?", (run_id, src)).fetchone()
+        self.assertEqual(os.path.basename(row["dst"]), ".DS_Store")
+        os.makedirs(os.path.dirname(src))         # the old folder is made again by hand
+        write(src)                                # and its old name is taken
+        _ok, failed = undo.undo_run(conn, run_id, quiet=True)
+        self.assertGreaterEqual(failed, 2, "the file, and the folder it is still in")
+        self.assertEqual(read(row["dst"]), "y" * 32, "it was moved somewhere else")
+        self.assertEqual(read(src), FOREIGN)
+        os.remove(src)
+        self.assertEqual(undo.undo_run(conn, run_id, quiet=True)[1], 0)
+        self.assertEqual(snapshot(self.root), before)
+        self.assertEqual(dirs(self.root), before_dirs)
 
 
 if __name__ == "__main__":

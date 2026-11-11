@@ -19,6 +19,7 @@ import errno
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ TEMP_SUFFIX = ".plexrenamer-tmp"
 # Folder metadata the OS writes by itself. It never counts as content, and it is
 # never deleted: when its folder has to go it moves up to the parent.
 METADATA_RE = re.compile(r"(?:\.DS_Store|Thumbs\.db)(?:-\d+)?")
+# The reason on a journal row that was added while the run was under way.
+METADATA_MOVE = "folder metadata moved up, its folder is removed"
 
 
 @dataclass
@@ -302,6 +305,63 @@ def holds(path: str, inode: int) -> bool:
         return False
 
 
+def exists(path: str) -> bool:
+    """Like os.path.lexists, except that only "no such file" means it is not there.
+
+    lexists turns every error into False. On a network share an error can be a
+    hiccup, and a hiccup must never be read as a file or folder that is gone.
+    """
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
+def located(path: str, row, stale: bool) -> bool:
+    """True when what this journal row moved is at path.
+
+    Name, kind and size identify it. The inode is further proof, but only while
+    the numbers are the ones the journal recorded: a network share can hand out
+    new ones on every mount, and `stale` says that it has.
+    """
+    try:
+        st = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if bool(row["is_dir"]) != stat.S_ISDIR(st.st_mode):
+        return False
+    if row["size"] and st.st_size != row["size"]:
+        return False
+    return stale or not row["inode"] or st.st_ino == row["inode"]
+
+
+def inodes_are_stale(rows) -> bool:
+    """Whether the inode numbers in the journal are from another mount.
+
+    Looks at where the run's files are by name and size. When they are there and
+    most do not carry the recorded number, the share has numbered its files anew
+    since the run, and the numbers prove nothing either way.
+    """
+    found = matched = 0
+    for row in rows:
+        if row["kind"] != "rename" or not row["inode"]:
+            continue
+        for path in (row["dst"], row["src"]):
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if row["size"] and st.st_size != row["size"]:
+                continue
+            found += 1
+            matched += st.st_ino == row["inode"]
+            break
+        if found >= 200:
+            break
+    return found > 0 and matched * 2 < found
+
+
 def _took_effect(row) -> bool:
     """A rename is proven done when its file is at the destination and gone from
     the source. Without a recorded inode nothing is proven."""
@@ -339,8 +399,7 @@ def _lift_metadata(conn, run_id: int, directory: str) -> None:
         dst = free_name(parent, name)
         info = os.lstat(src)
         op_id = db.append_op(conn, run_id, "rename", src, dst, size=info.st_size,
-                             inode=info.st_ino, status="started",
-                             reason="folder metadata moved up, its folder is removed")
+                             inode=info.st_ino, status="started", reason=METADATA_MOVE)
         conn.commit()
         _do("rename", src, dst, info.st_ino)
         db.mark_op(conn, op_id, "done")
@@ -378,6 +437,7 @@ def verify_run(conn, run_id: int):
     good = bad = 0
     problems = []
     rows = db.run_ops(conn, run_id)
+    stale = inodes_are_stale(rows)
     # A file can move twice in one run: a swap staged through a temporary name,
     # or folder metadata lifted out of two nested folders. Its first destination
     # is then the source of a later move, and that later row is the one to check.
@@ -391,16 +451,14 @@ def verify_run(conn, run_id: int):
         if row["kind"] == "rename":
             if moved_on.get(row["dst"], 0) > row["seq"]:
                 good += 1
-                continue
-            if not os.path.lexists(row["dst"]):
+            elif not exists(row["dst"]):
                 problems.append(f"missing destination: {row['dst']}")
                 bad += 1
-                continue
-            if row["inode"] and os.lstat(row["dst"]).st_ino != row["inode"]:
-                problems.append(f"inode mismatch at {row['dst']}")
+            elif not located(row["dst"], row, stale):
+                problems.append(f"not what the run moved there: {row['dst']}")
                 bad += 1
-                continue
-            good += 1
+            else:
+                good += 1
         elif row["kind"] == "mkdir" and not os.path.isdir(row["dst"]):
             problems.append(f"missing directory: {row['dst']}")
             bad += 1

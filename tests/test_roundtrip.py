@@ -68,6 +68,15 @@ def dirs(root):
             for base, names, _files in os.walk(root) for name in names}
 
 
+def remount(root):
+    """Swap the tree for an identical copy: the same names and contents, every
+    inode number new. That is how a network share comes back after a remount."""
+    copy = root + ".remounted"
+    shutil.copytree(root, copy, symlinks=True)
+    shutil.rmtree(root)
+    os.rename(copy, root)
+
+
 class SwapMove:
     """The smallest thing build_ops accepts as a move."""
 

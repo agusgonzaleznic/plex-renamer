@@ -10,7 +10,7 @@ import os
 import unittest
 from unittest import mock
 
-from test_roundtrip import CATS, LibraryCase, SwapMove, contents, dirs, snapshot
+from test_roundtrip import CATS, LibraryCase, SwapMove, contents, dirs, remount, snapshot
 
 from plexrenamer import db, executor, undo
 
@@ -70,9 +70,10 @@ class Recovery(LibraryCase):
         self.tearDown()
         self.setUp()
 
-    def _every_cut(self, journal, during_undo=False):
+    def _every_cut(self, journal, during_undo=False, remounted=False):
         """Cut a run off at each step in turn, before and after the step touches
-        the disk, then undo and yield where it was cut."""
+        the disk, then undo and yield where it was cut. With `remounted`, the
+        share comes back with new inode numbers before the undo."""
         module, step_name = (undo, "_settle") if during_undo else (executor, "_do")
         for after in (False, True):
             stop_at = 0
@@ -94,6 +95,8 @@ class Recovery(LibraryCase):
                 conn.close()                  # the process is gone
                 if finished:
                     break                     # stop_at is past the last step
+                if remounted:
+                    remount(self.root)
                 conn = db.connect(self.dbpath)
                 _ok, failed = undo.undo_run(conn, run_id, quiet=True)
                 conn.close()
@@ -118,6 +121,35 @@ class Recovery(LibraryCase):
             self.assertEqual(snapshot(self.root), before, where)
             self.assertEqual(dirs(self.root), before_dirs, where)
         self.assertGreater(cuts, 60, "the loop did not reach the interruption points")
+
+    def test_a_run_cut_off_anywhere_is_fully_undone_after_a_remount(self):
+        before, before_dirs = snapshot(self.root), dirs(self.root)
+        cuts = 0
+        for during_undo in (False, True):
+            for where in self._every_cut(self._journal, during_undo, remounted=True):
+                cuts += 1
+                self.assertEqual(snapshot(self.root), before, where)
+                self.assertEqual(dirs(self.root), before_dirs, where)
+        self.assertGreater(cuts, 120, "the loop did not reach the interruption points")
+
+    def test_a_remount_does_not_stop_undo_or_verify(self):
+        before, before_dirs = snapshot(self.root), dirs(self.root)
+        conn, run_id = self._journal()
+        self.assertEqual(executor.apply_ops(conn, run_id, quiet=True)[1], 0)
+        good, bad, problems = executor.verify_run(conn, run_id)
+        remount(self.root)
+        self.assertEqual(executor.verify_run(conn, run_id), (good, 0, []),
+                         "a remount must not turn every file into a mismatch")
+        victim = next(r["dst"] for r in db.run_ops(conn, run_id)
+                      if r["kind"] == "rename" and r["dst"].endswith(".mp4"))
+        with open(victim, "a") as fh:
+            fh.write("grown")                 # control: verify still sees a real change
+        self.assertEqual(executor.verify_run(conn, run_id)[1], 1)
+        with open(victim, "r+") as fh:
+            fh.truncate(os.path.getsize(victim) - len("grown"))
+        self.assertEqual(undo.undo_run(conn, run_id, quiet=True)[1], 0)
+        self.assertEqual(snapshot(self.root), before)
+        self.assertEqual(dirs(self.root), before_dirs)
 
     def test_swap_cut_off_anywhere_is_fully_undone(self):
         cuts = 0

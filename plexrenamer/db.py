@@ -129,9 +129,10 @@ def newest_standing_run(conn):
 
 def standing_runs_after(conn, run_id: int, root: str):
     """Later runs on the same library that are not undone, newest first."""
+    same = os.path.normpath(root)        # "/Volumes/X/" and "/Volumes/X" are one library
     return [row["id"] for row in conn.execute(
-        f"SELECT id FROM run WHERE id > ? AND root = ? AND {_STANDING} ORDER BY id DESC",
-        (run_id, root))]
+        f"SELECT id, root FROM run WHERE id > ? AND {_STANDING} ORDER BY id DESC", (run_id,))
+        if os.path.normpath(row["root"]) == same]
 
 
 def set_run_status(conn, run_id: int, status: str, finished: bool = False) -> None:
