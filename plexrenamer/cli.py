@@ -294,12 +294,34 @@ def cmd_verify(args):
     return 0 if bad == 0 else 1
 
 
+_NAME_SEP = "\x1f"
+
+
+def _close_category_list(argv, commands):
+    """`--categories A B plan` handed `plan` to --categories, which took any
+    number of names, and the command line failed. Fold the names into one
+    argument that ends in front of the first option or sub-command."""
+    out, i = [], 0
+    while i < len(argv):
+        out.append(argv[i])
+        if argv[i] != "--categories":
+            i += 1
+            continue
+        j = i + 1
+        while j < len(argv) and not argv[j].startswith("-") and argv[j] not in commands:
+            j += 1
+        out.append(_NAME_SEP.join(argv[i + 1:j]))
+        i = j
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser("plexrenamer", description=__doc__)
     ap.add_argument("--root", default="/Volumes/Multimedia")
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--decisions", default=DEFAULT_DECISIONS)
-    ap.add_argument("--categories", nargs="*", default=CATEGORIES)
+    ap.add_argument("--categories", default=CATEGORIES, metavar="NAME [NAME ...]",
+                    type=lambda names: [n for n in names.split(_NAME_SEP) if n])
     ap.add_argument("--episode-case", choices=["upper", "lower"], default="upper")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -319,7 +341,8 @@ def main(argv=None):
     p = sub.add_parser("status"); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("verify"); p.add_argument("--run", type=int); p.set_defaults(fn=cmd_verify)
 
-    args = ap.parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = ap.parse_args(_close_category_list(argv, sub.choices))
     naming.EPISODE_CASE = args.episode_case
     return args.fn(args)
 

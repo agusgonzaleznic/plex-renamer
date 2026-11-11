@@ -46,6 +46,25 @@ def _sub_flavour(sub_stem: str, video_stem: str):
     return util.normalize_lang(extra)
 
 
+def _sub_language(lang, leftover):
+    """Decide the language code when the name gave none this tool knows.
+
+    Plex ignores a sidecar without a language code, so one is always emitted.
+    Release tools name subtitle files by ISO-639-2 code, so a bare three-letter
+    tag that is not in the table ("fil" was one) is taken as the code it is,
+    where it used to be kept as a label on a file called English. Lint lists
+    every code the table does not know, so a tag that was no language shows up.
+    """
+    if lang:
+        return lang, leftover
+    tag = (leftover or "").lower()
+    # "und" is the ISO code for undetermined: it says nothing, so English stays
+    # the guess for it, as for a name with no tag at all
+    if re.fullmatch(r"[a-z]{3}", tag) and tag != "und":
+        return tag, ""
+    return "en", leftover
+
+
 def _unique_subtitle(used: dict, stem: str, lang, forced, sdh, leftover, ext: str,
                      current: str | None = None):
     """Pick a subtitle name Plex can still parse when one language repeats.
