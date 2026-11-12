@@ -20,11 +20,11 @@ import os
 import re
 import shutil
 import stat
-import sys
 import time
 from dataclasses import dataclass
 
 from . import db
+from .progress import Progress
 
 TEMP_SUFFIX = ".plexrenamer-tmp"
 # Folder metadata the OS writes by itself. It never counts as content, and it is
@@ -202,62 +202,6 @@ def _prunable_dirs(moves, created, boundaries=()):
     return sorted(candidates, key=lambda p: p.count(os.sep), reverse=True)
 
 
-class Progress:
-    def __init__(self, total: int, label: str = "", width: int = 38):
-        self.total, self.label, self.width = max(total, 1), label, width
-        self.n = 0
-        self.start = time.time()
-        self.tty = sys.stdout.isatty()
-        self.last = 0.0
-        self.last_pct = -1
-
-    def step(self, n: int = 1, note: str = ""):
-        self.n += n
-        now = time.time()
-        pct = int(self.n * 100 / self.total)
-        if self.tty:
-            if now - self.last < 0.08 and self.n < self.total:
-                return
-        elif pct == self.last_pct and self.n < self.total:
-            return
-        self.last, self.last_pct = now, pct
-        self.render(note)
-
-    def render(self, note: str = ""):
-        elapsed = time.time() - self.start
-        rate = self.n / elapsed if elapsed > 0 else 0
-        eta = (self.total - self.n) / rate if rate > 0 else 0
-        filled = int(self.width * self.n / self.total)
-        bar = "#" * filled + "." * (self.width - filled)
-        line = (f"{self.label} [{bar}] {self.n}/{self.total} "
-                f"{self.n * 100 / self.total:5.1f}%  {rate:6.1f}/s  "
-                f"eta {fmt_duration(eta)}")
-        if note:
-            line += f"  {note[:48]}"
-        if self.tty:
-            sys.stdout.write("\r" + line.ljust(140)[:140])
-            sys.stdout.flush()
-        else:
-            print(line, flush=True)
-
-    def close(self):
-        self.render()
-        if self.tty:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
-
-def fmt_duration(seconds: float) -> str:
-    seconds = int(max(seconds, 0))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h}h{m:02d}m{s:02d}s"
-    if m:
-        return f"{m}m{s:02d}s"
-    return f"{s}s"
-
-
 def apply_ops(conn, run_id: int, label: str = "apply", quiet: bool = False):
     """Run every pending op of a run.
 
@@ -270,17 +214,24 @@ def apply_ops(conn, run_id: int, label: str = "apply", quiet: bool = False):
     todo = [r for r in rows if r["status"] == "pending"]
     bar = None if quiet else Progress(len(todo), label)
     ok = failed = 0
+    # Whether a file keeps its inode number when this volume renames it. The first
+    # rename shows it. Where it does not, a number proves nothing from then on.
+    keeps = None
     for row in todo:
         db.mark_op(conn, row["id"], "started")
         conn.commit()
         try:
             if row["kind"] == "rmdir":
                 _lift_metadata(conn, run_id, row["src"])
-            _do(row["kind"], row["src"], row["dst"], row["inode"])
+            elif row["kind"] == "rename":
+                _refuse_changed(row)
+            _do(row["kind"], row["src"], row["dst"], row["inode"] if keeps is not False else 0)
+            if keeps is None and row["kind"] == "rename" and row["inode"]:
+                keeps = _kept_number(row)
             db.mark_op(conn, row["id"], "done")
             ok += 1
         except Exception as exc:                      # noqa: BLE001
-            if row["kind"] == "rename" and _took_effect(row):
+            if row["kind"] == "rename" and _took_effect(row, keeps):
                 # a network share can report an error for a rename that went
                 # through, when the reply is lost
                 db.mark_op(conn, row["id"], "done",
@@ -300,7 +251,7 @@ def apply_ops(conn, run_id: int, label: str = "apply", quiet: bool = False):
 def holds(path: str, inode: int) -> bool:
     """True when path exists and is the very file or folder with that inode."""
     try:
-        return os.lstat(path).st_ino == inode
+        return db.inode_of(os.lstat(path)) == inode
     except OSError:
         return False
 
@@ -322,8 +273,8 @@ def located(path: str, row, stale: bool) -> bool:
     """True when what this journal row moved is at path.
 
     Name, kind and size identify it. The inode is further proof, but only while
-    the numbers are the ones the journal recorded: a network share can hand out
-    new ones on every mount, and `stale` says that it has.
+    the journal's numbers still tell files apart, and `stale` says that they no
+    longer do.
     """
     try:
         st = os.lstat(path)
@@ -333,40 +284,87 @@ def located(path: str, row, stale: bool) -> bool:
         return False
     if row["size"] and st.st_size != row["size"]:
         return False
-    return stale or not row["inode"] or st.st_ino == row["inode"]
+    return stale or not row["inode"] or db.inode_of(st) == row["inode"]
 
 
 def inodes_are_stale(rows) -> bool:
-    """Whether the inode numbers in the journal are from another mount.
+    """Whether the journal's inode numbers no longer tell this run's files apart.
 
-    Looks at where the run's files are by name and size. When they are there and
-    most do not carry the recorded number, the share has numbered its files anew
-    since the run, and the numbers prove nothing either way.
+    A number proves which file is which only where a file keeps its number when
+    it moves, and only while the mount lasts. A network share can number its
+    files anew on every mount, or work each number out from the path, which
+    gives a file another one with every rename. Either way a file the run moved
+    no longer carries the number on record, so the moved files are the ones to
+    ask: the rows whose file is at its destination, by kind and size, decide.
+    Only when no row is, the rows whose file is at its source do. A file at its
+    source proves less, because a number worked out from the path is always
+    the recorded one there.
     """
-    found = matched = 0
-    for row in rows:
-        if row["kind"] != "rename" or not row["inode"]:
-            continue
-        for path in (row["dst"], row["src"]):
+    for end in ("dst", "src"):
+        found = matched = 0
+        for row in rows:
+            if row["kind"] != "rename" or not row["inode"] or row["status"] == "undone":
+                continue
             try:
-                st = os.lstat(path)
+                st = os.lstat(row[end])
             except OSError:
+                continue
+            if bool(row["is_dir"]) != stat.S_ISDIR(st.st_mode):
                 continue
             if row["size"] and st.st_size != row["size"]:
                 continue
             found += 1
-            matched += st.st_ino == row["inode"]
-            break
-        if found >= 200:
-            break
-    return found > 0 and matched * 2 < found
+            matched += db.inode_of(st) == row["inode"]
+            if found >= 200:
+                break
+        if found:
+            return matched * 2 < found
+    return False
 
 
-def _took_effect(row) -> bool:
+def _took_effect(row, keeps) -> bool:
     """A rename is proven done when its file is at the destination and gone from
-    the source. Without a recorded inode nothing is proven."""
-    return bool(row["inode"]) and not os.path.lexists(row["src"]) \
-        and holds(row["dst"], row["inode"])
+    the source.
+
+    The inode proves that it is that file. On a volume that has shown that a
+    moved file gets another number (`keeps` is False), its kind and size have
+    to. Without a recorded inode, or without a size where the number cannot be
+    asked, nothing is proven.
+    """
+    if not row["inode"] or os.path.lexists(row["src"]):
+        return False
+    if keeps is False:
+        return bool(row["size"]) and located(row["dst"], row, stale=True)
+    return holds(row["dst"], row["inode"])
+
+
+def _kept_number(row):
+    """Whether the file a rename has just moved still has the inode number on
+    record. None when its destination cannot be read right now, so that one
+    hiccup does not settle the question for the whole run."""
+    try:
+        return db.inode_of(os.lstat(row["dst"])) == row["inode"]
+    except OSError:
+        return None
+
+
+def _refuse_changed(row) -> None:
+    """Stop a rename whose source is no longer, by kind and size, what was planned.
+
+    A file that has grown or been replaced since the plan was made stays where it
+    is. Moving it would put a file into the journal that undo could not find
+    again, because undo knows a file by its name, kind and size. A source that
+    is not there at all is left for the rename itself to report.
+    """
+    try:
+        st = os.lstat(row["src"])
+    except OSError:
+        return
+    if bool(row["is_dir"]) != stat.S_ISDIR(st.st_mode):
+        raise PlanError(f"no longer a {'folder' if row['is_dir'] else 'file'}: {row['src']}")
+    if row["size"] and st.st_size != row["size"]:
+        raise PlanError(f"size changed for {row['src']}: planned {row['size']} bytes, "
+                        f"now {st.st_size}")
 
 
 def free_name(parent: str, name: str) -> str:
@@ -398,10 +396,11 @@ def _lift_metadata(conn, run_id: int, directory: str) -> None:
         src = os.path.join(directory, name)
         dst = free_name(parent, name)
         info = os.lstat(src)
+        inode = db.inode_of(info)
         op_id = db.append_op(conn, run_id, "rename", src, dst, size=info.st_size,
-                             inode=info.st_ino, status="started", reason=METADATA_MOVE)
+                             inode=inode, status="started", reason=METADATA_MOVE)
         conn.commit()
-        _do("rename", src, dst, info.st_ino)
+        _do("rename", src, dst, inode)
         db.mark_op(conn, op_id, "done")
         conn.commit()
 
@@ -423,7 +422,7 @@ def _do(kind: str, src, dst, inode):
     if not os.path.lexists(src):
         raise FileNotFoundError(src)
     if inode:
-        actual = os.lstat(src).st_ino
+        actual = db.inode_of(os.lstat(src))
         if actual != inode:
             raise PlanError(f"inode changed for {src}: expected {inode}, saw {actual}")
     if os.path.lexists(dst):

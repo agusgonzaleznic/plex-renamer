@@ -160,14 +160,33 @@ class UndoSafety(LibraryCase):
         self.assertEqual(read(self.src), "h" * 32)
         self.assertEqual(self._movie_row(conn, run_id)["status"], "failed")
 
-    def test_apply_refuses_a_source_that_is_no_longer_the_planned_file(self):
+    def test_apply_refuses_a_source_of_the_same_size_that_is_another_file(self):
         conn, run_id = self._journal()
         os.rename(self.src, self.src + ".old")
-        write(self.src)
+        write(self.src, "s" * 32)                 # same size as the film, another file
         _ok, failed = executor.apply_ops(conn, run_id, quiet=True)
         self.assertEqual(failed, 1)
-        self.assertEqual(read(self.src), FOREIGN, "a file the plan never saw was moved")
+        self.assertEqual(read(self.src), "s" * 32, "a file the plan never saw was moved")
         self.assertIn("inode changed", self._movie_row(conn, run_id)["error"])
+
+    def test_apply_refuses_a_source_that_has_changed_size(self):
+        conn, run_id = self._journal()
+        with open(self.src, "a") as fh:
+            fh.write("still being written")       # the same file, grown since the plan
+        _ok, failed = executor.apply_ops(conn, run_id, quiet=True)
+        self.assertEqual(failed, 1)
+        self.assertEqual(read(self.src), "h" * 32 + "still being written")
+        self.assertFalse(os.path.lexists(self.dst), "undo could not have found it there")
+        self.assertIn("size changed", self._movie_row(conn, run_id)["error"])
+
+    def test_apply_refuses_a_source_that_has_become_a_folder(self):
+        conn, run_id = self._journal()
+        os.rename(self.src, self.src + ".old")
+        os.mkdir(self.src)
+        _ok, failed = executor.apply_ops(conn, run_id, quiet=True)
+        self.assertEqual(failed, 1)
+        self.assertTrue(os.path.isdir(self.src), "a folder was moved in place of the film")
+        self.assertIn("no longer a file", self._movie_row(conn, run_id)["error"])
 
     def test_a_created_folder_that_holds_other_files_is_kept(self):
         conn, run_id = self._applied()

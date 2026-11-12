@@ -4,8 +4,9 @@ Undo is built on two things that survive whatever stopped a run: the plan, which
 is in the journal before the first operation, and the disk. The status of a row
 only says what to expect. Each row is settled by where the thing it moved is
 now, found by name, kind and size, so undo never moves what it cannot identify.
-The inode is extra proof while the journal's numbers still hold; a network share
-numbers its files anew on every mount, and then they are not asked for.
+The inode is extra proof while the journal's numbers still tell files apart. A
+network share can number its files anew on every mount, or work each number out
+from the path, and then the numbers are not asked for.
 
 A row that cannot be settled keeps its status and is tried again by the next
 undo. Nothing is marked as undone that is not.
@@ -17,8 +18,9 @@ import os
 from dataclasses import dataclass
 
 from . import db
-from .executor import (METADATA_MOVE, METADATA_RE, PlanError, Progress, exists,
-                       free_name, inodes_are_stale, located)
+from .executor import (METADATA_MOVE, METADATA_RE, PlanError, exists, free_name,
+                       inodes_are_stale, located)
+from .progress import Progress
 
 # What the journal says about a row before undo looks at the disk. An expected
 # row ran, or was in flight when its run was cut off ("started"), so it has to be
@@ -35,7 +37,7 @@ class VolumeGone(PlanError):
 @dataclass
 class _Run:
     """What undo works out about a run before it settles a single row."""
-    stale: bool     # the journal's inode numbers are from another mount
+    stale: bool     # the journal's inode numbers no longer tell files apart
     reached: int    # the highest planned row the run is known to have got to
     owned: set      # destinations of this run's renames that are not moved back
 

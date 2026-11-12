@@ -16,7 +16,10 @@ section; the code does not read it. Of its 260 rules, 155 are marked
   empty again. A folder that appears at a planned path before the run gets to it
   counts as created by the run. Folder metadata (`.DS_Store`, `Thumbs.db`) is not
   deleted either: when its folder has to go, it moves up to the parent (as
-  `.DS_Store-1` and so on when the name is taken).
+  `.DS_Store-1` and so on when the name is taken). A server can keep files of
+  its own hidden from the share, as a QNAP does with its thumbnail caches. The
+  tool never sees those, and what becomes of them when their folder is removed
+  is up to the server.
 - **The one thing the tool deletes is its own.** To estimate the running time,
   `apply` writes 60 scratch files to `<root>/.plexrenamer-benchmark`, times
   renaming them and removes them and that folder again, also on `--dry-run`.
@@ -25,13 +28,15 @@ section; the code does not read it. Of its 260 rules, 155 are marked
   The whole plan is in the SQLite journal before the first operation, each rename
   with the size and inode of its source, and each operation is marked as started
   before it runs and as done after. `undo` goes through the journal backwards and
-  settles every row by where its file is now, found by name, kind and size. The
-  inode is extra proof while the journal's numbers still hold; a network share
-  can number its files anew on every mount, and then it is not asked for. That
+  settles every row by where its file is now, found by name, kind and size. That
   way `undo` also reverses an operation that was in flight when the run stopped
   (Ctrl-C, a kill, a crash), one whose mark never reached the journal, and a
-  rename that went through although the share reported an error. When `apply` or
-  `prune` moves folder metadata, that move is in the journal too.
+  rename that went through although the share reported an error. The inode is
+  extra proof while the journal's numbers still tell files apart. A network
+  share can number its files anew on every mount, or work each number out from
+  the path, so that every rename changes it. The files the run moved show
+  whether it has, and then the inode is not asked for. When `apply` or `prune`
+  moves folder metadata, that move is in the journal too.
 - **Undo does not guess and does not give up.** It never moves a file onto an
   original path that has been taken, moves back only what it finds by name, kind
   and size where the run was to put it, and keeps a folder a run created while
@@ -42,11 +47,17 @@ section; the code does not read it. Of its 260 rules, 155 are marked
   refuses while a later one does, unless `--force` is given.
 - **What undo cannot do.** It cannot bring back what is no longer there: a file
   that was deleted, moved elsewhere or replaced since the run stays as a failed
-  row, and the run stays partly undone. A folder, and a file whose size the
-  journal does not hold, is known by name and kind alone.
+  row, and the run stays partly undone. An older run can then still be undone by
+  naming it with `--run` and adding `--force`. A folder, and a file whose size
+  the journal does not hold, is known by name and kind alone. Where the inode
+  cannot be asked, that is not enough to reverse a move the journal has on
+  record as failed, and a file of the same name, kind and size cannot be told
+  from the one the run moved.
 - **The plan is validated before anything moves.** Two sources mapping to one
   destination, a vanished source, or an already-occupied destination all abort the
-  run rather than overwrite.
+  run rather than overwrite. Each file is looked at again right before its own
+  move: one that has changed size since the plan, or is no longer the planned
+  file by its inode where that tells, stays where it is.
 - **One writer at a time.** The checks look at a path and then rename it, and
   nothing locks the library. Run the tool while nothing else writes to it.
 - **Pruning cannot escape the library.** Empty-directory removal is bounded to the
@@ -80,7 +91,8 @@ point at a different override directory.
    title, year, database ids, movie/show, editions, or skip.
 4. **planner** turns each title into concrete file moves.
 5. **executor** validates, expands into `mkdir` / `rename` / `rmdir` operations,
-   journals them, runs them with a progress bar, then verifies inodes on disk.
+   journals them, runs them with a progress bar, then checks that every file is
+   where the journal says, by name, kind and size.
 6. **undo** settles every journal row against the disk, newest first.
 
 ## Naming applied
@@ -126,7 +138,11 @@ been swapped for a copy with new inode numbers in between, which is what a
 remount does. The safety tests put somebody else's files in the way, take the
 library away, lose a reply from the share and undo runs out of order, and check
 that no foreign file is touched and that every row that could not be undone is
-still there for the next try.
+still there for the next try. The share tests put the library on the inode
+numbers an SMB share was seen to hand out on macOS: numbers above 2^63 - 1,
+which are more than an SQLite integer holds, and numbers worked out from the
+path, which change with every rename. On the second kind the round trip,
+recovery and safety tests all run a second time.
 
 ## Pruning shells left behind by a rename
 

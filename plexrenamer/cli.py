@@ -8,7 +8,7 @@ import json
 import os
 import sys
 
-from . import classify, db, decisions, executor, lint, naming, scan, undo
+from . import classify, db, decisions, executor, lint, naming, progress, scan, undo
 from .planner import Planner
 
 CATEGORIES = ["Animated Movies", "Animated Series", "Anime Movies", "Anime Series",
@@ -18,6 +18,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(HERE, "state", "plex-renamer.db")
 DEFAULT_DECISIONS = os.path.join(HERE, "decisions")
 REPORTS = os.path.join(HERE, "reports")
+SHOWN = 60          # how many failed rows undo prints before it only counts them
 
 
 def build(root, categories, decisions_dir):
@@ -150,7 +151,7 @@ def cmd_apply(args):
     print(f"units         : {len(units)}")
     print(f"operations    : {len(ops)}  ({', '.join(f'{k}={v}' for k, v in kinds.items())})")
     print(f"measured rate : {rate:.0f} ops/sec on this filesystem")
-    print(f"ESTIMATED TIME: {executor.fmt_duration(eta)}")
+    print(f"ESTIMATED TIME: {progress.fmt_duration(eta)}")
     if args.dry_run:
         print("dry run, nothing changed")
         return 0
@@ -215,9 +216,13 @@ def cmd_undo(args):
     if failed:
         notes = [r for r in db.run_ops(conn, run_id)
                  if r["status"] != "undone" and (r["error"] or "").startswith("undo:")]
-        for r in notes[:20]:
+        for r in notes[:SHOWN]:
             print(f"  {r['kind']} {r['dst'] or r['src']}: {r['error'][6:]}")
-        print("Rows that failed keep their state: fix the cause and run undo again.")
+        if len(notes) > SHOWN:
+            print(f"  ... and {len(notes) - SHOWN} more, each with its reason in the journal")
+        print("Rows that failed keep their state: fix the cause and run undo again.\n"
+              "To undo an older run although this one is not fully undone, name it with "
+              "--run and add --force.")
     return 0 if not failed else 1
 
 

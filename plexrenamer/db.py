@@ -57,6 +57,18 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def inode_of(st) -> int:
+    """The inode number of a stat result, in the form the journal can hold.
+
+    SQLite integers are signed 64-bit, and a network share can number its files
+    above that range, so the upper half wraps to negative. Every inode in this
+    package is read with this function, so two of them are equal exactly when
+    the numbers on disk are. 0 still means that none was recorded.
+    """
+    ino = st.st_ino
+    return ino - (1 << 64) if ino >= (1 << 63) else ino
+
+
 def connect(path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(path, timeout=60)

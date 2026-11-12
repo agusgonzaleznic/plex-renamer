@@ -83,7 +83,7 @@ class SwapMove:
     def __init__(self, src, dst, with_inode=False):
         self.src, self.dst = src, dst
         self.is_dir, self.size = False, 0
-        self.inode = os.lstat(src).st_ino if with_inode else 0
+        self.inode = db.inode_of(os.lstat(src)) if with_inode else 0
         self.category, self.unit, self.reason = "", "", "swap"
 
 

@@ -78,6 +78,16 @@ class UndoCommand(LibraryCase):
         self.assertEqual(snapshot(self.root), self.before)
         self.assertEqual(dirs(self.root), self.before_dirs)
 
+    def test_undo_says_how_to_go_on_and_counts_what_it_does_not_list(self):
+        self.assertEqual(self._cli("apply", "--rate", "5000")[0], 0)
+        write(self.src)                           # blocks the film and the folder it is in
+        with mock.patch.object(cli, "SHOWN", 1):
+            code, out = self._cli("undo")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(out.count("PlanError"), 1, "one row listed, the other counted")
+        self.assertIn("... and 1 more", out)
+        self.assertIn("--force", out)
+
     def test_undo_changes_nothing_while_the_library_is_away(self):
         self.assertEqual(self._cli("apply", "--rate", "5000")[0], 0)
         away = self.root + ".away"
