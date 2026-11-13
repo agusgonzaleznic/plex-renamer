@@ -4,11 +4,13 @@ The journal is written ahead of the disk: the whole plan is in it before the
 first operation, and an operation is marked "started" and committed before it
 runs, then "done" or "failed".
 
-The tool deletes nothing in the library. The only things it removes there are
-empty directories: a listing must show one empty, and no "._" file of its name
-may sit beside it, which is where some volumes keep a folder's attributes. The
-speed test removes only the scratch files it wrote into a new folder of its
-own, and then that folder, unless something else is in it.
+The only files the tool deletes in the library are torrent-site ads and
+.DS_Store files (junk.py), each with its bytes in the journal first, so undo
+writes it back. Besides those it removes only empty directories: a listing must
+show one empty, and no "._" file of its name may sit beside it, which is where
+some volumes keep a folder's attributes. The speed test removes only the
+scratch files it wrote into a new folder of its own, and then that folder,
+unless something else is in it.
 
 A path that cannot be looked up is never read as a path that is free or gone.
 Only "no such file" means that. Any other error stops the operation in hand.
@@ -24,12 +26,13 @@ import stat
 import tempfile
 import time
 
-from . import db
+from . import db, junk
 from .ops import TEMP_SUFFIX, Op, PlanError, build_ops, validate  # noqa: F401
 from .progress import Progress
 
-# Folder metadata the OS writes by itself. It never counts as content, and it is
-# never deleted: when its folder has to go it moves up to the parent.
+# Folder metadata the OS writes by itself. It never counts as content, and a
+# move never deletes it: when its folder has to go it moves up to the parent.
+# A .DS_Store goes later with the junk (junk.py), its bytes in the journal.
 METADATA_RE = re.compile(r"(?:\.DS_Store|Thumbs\.db)(?:-\d+)?")
 # The reason on a journal row that was added while the run was under way.
 METADATA_MOVE = "folder metadata moved up, its folder is removed"
@@ -73,6 +76,9 @@ def apply_ops(conn, run_id: int, label: str = "apply", quiet: bool = False):
                 _lift_metadata(conn, run_id, row["src"])
             elif row["kind"] == "rename":
                 _refuse_changed(row)
+            elif row["kind"] == "delete":
+                junk.keep(conn, row, row["inode"] if keeps is not False else 0)
+                db.commit_durably(conn)     # its bytes are in the journal before it goes
             _do(row["kind"], row["src"], row["dst"], row["inode"] if keeps is not False else 0)
         except Exception as exc:                      # noqa: BLE001
             status, note = _outcome(row, keeps, exc)
@@ -108,10 +114,10 @@ def _outcome(row, keeps, exc) -> tuple:
         if row["kind"] == "mkdir" and isinstance(exc, FileExistsError):
             return "undone", f"already there, not made by this run: {row['dst']}"
         note = f"{type(exc).__name__}: {exc}"
-        return "failed", NOT_TRIED + note if row["kind"] == "rename" else note
-    if row["kind"] == "rename":
+        return "failed", NOT_TRIED + note if row["kind"] in ("rename", "delete") else note
+    if row["kind"] in ("rename", "delete"):
         try:
-            if _took_effect(row, keeps):
+            if _took_effect(row, keeps) if row["kind"] == "rename" else not exists(row["src"]):
                 return "done", f"took effect although it reported {exc}"
         except OSError as lookup:
             return "failed", (f"{exc}, and whether it took effect could not be read "
@@ -173,7 +179,7 @@ def located(path: str, row, stale: bool) -> bool:
     return stale or not row["inode"] or db.inode_of(st) == row["inode"]
 
 
-def inodes_are_stale(rows) -> bool:
+def inodes_are_stale(rows, rewritten=()) -> bool:
     """Whether the journal's inode numbers no longer tell this run's files apart.
 
     A number proves which file is which only where a file keeps its number when
@@ -187,12 +193,19 @@ def inodes_are_stale(rows) -> bool:
     the recorded one there.
 
     A path that cannot be looked up raises. Skipping it could hand the decision
-    to the weaker evidence, and that answer steers every row of the run.
+    to the weaker evidence, and that answer steers every row of the run. A file
+    that a later delete took and undo wrote back has a number of its own anyway,
+    so its row does not count: a delete of the run, or one of a later run whose
+    paths are in `rewritten`.
     """
+    rows = list(rows)
+    deleted = {r["src"]: r["seq"] for r in rows if r["kind"] == "delete"}
     for end in ("dst", "src"):
         found = matched = 0
         for row in rows:
-            if row["kind"] != "rename" or not row["inode"] or row["status"] == "undone":
+            if row["kind"] != "rename" or not row["inode"] or row["status"] == "undone" \
+                    or row["dst"] in rewritten \
+                    or (row["dst"] in deleted and deleted[row["dst"]] > row["seq"]):
                 continue
             st = _look(row[end])
             if st is None:
@@ -341,6 +354,12 @@ def _do(kind: str, src, dst, inode):
     if kind == "rmdir":
         remove_empty(src)
         return
+    if kind == "delete":
+        try:
+            os.unlink(src)
+        except OSError as exc:
+            raise Unconfirmed(exc) from exc
+        return
     if not exists(src):
         raise FileNotFoundError(src)
     if inode:
@@ -365,31 +384,35 @@ def verify_run(conn, run_id: int):
     good = bad = 0
     problems = []
     rows = db.run_ops(conn, run_id)
+    kept = db.kept_of_run(conn, run_id)
     stale = inodes_are_stale(rows)
     # A file can move twice in one run: a swap staged through a temporary name,
     # or folder metadata lifted out of two nested folders. Its first destination
     # is then the source of a later move, and that later row is the one to check.
+    # So is a later delete, of an ad a move hid or of a .DS_Store a move lifted.
     moved_on = {}
     for row in rows:
-        if row["status"] == "done" and row["kind"] == "rename":
+        if row["status"] == "done" and row["kind"] in ("rename", "delete"):
             moved_on[row["src"]] = max(moved_on.get(row["src"], 0), row["seq"])
     for row in rows:
         if row["status"] != "done":
             continue
         try:
-            problem = _mismatch(row, moved_on, stale)
+            problem = _mismatch(row, moved_on, stale, kept)
         except OSError as exc:
-            problem = f"cannot be read ({type(exc).__name__}: {exc}): {row['dst']}"
+            problem = f"cannot be read ({type(exc).__name__}: {exc}): {row['dst'] or row['src']}"
         if problem:
             problems.append(problem)
             bad += 1
-        elif row["kind"] == "rename":
+        elif row["kind"] in ("rename", "delete"):
             good += 1
     return good, bad, problems
 
 
-def _mismatch(row, moved_on, stale):
+def _mismatch(row, moved_on, stale, kept=None):
     """What is wrong on disk with a row the journal has as done, or None."""
+    if row["kind"] == "delete":
+        return junk.still_there(row, (kept or {}).get(row["id"]))
     if row["kind"] == "rename":
         if moved_on.get(row["dst"], 0) > row["seq"]:
             return None
