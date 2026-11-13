@@ -78,7 +78,12 @@ def inode_of(st) -> int:
     return ino - (1 << 64) if ino >= (1 << 63) else ino
 
 
-def connect(path: str) -> sqlite3.Connection:
+def connect(path: str, create: bool = True) -> sqlite3.Connection:
+    """Open the journal. With create=False a journal that is not there is refused: the commands
+    that read past runs would otherwise make an empty one and find nothing to do."""
+    if not create and not os.path.isfile(path):
+        raise SystemExit(f"no journal at {os.path.abspath(path)}: run from the folder that "
+                         f"holds state/, or name the journal with --db")
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(path, timeout=60)
     conn.row_factory = sqlite3.Row

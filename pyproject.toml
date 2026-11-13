@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "plex-renamer"
+dynamic = ["version"]
+description = "Renames a local media volume to the naming standard Plex publishes, with a SQLite journal that can reverse any run."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "Agustin Gonzalez Nicolini" }]
+keywords = ["plex", "media", "rename", "naming", "undo"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Video",
+]
+
+[project.scripts]
+plex-renamer = "plexrenamer:console"
+
+[project.urls]
+Source = "https://github.com/agusgonzaleznic/plex-renamer"
+Issues = "https://github.com/agusgonzaleznic/plex-renamer/issues"
+Changelog = "https://github.com/agusgonzaleznic/plex-renamer/releases"
+
+[tool.hatch.version]
+path = "plexrenamer/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["plexrenamer"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["plexrenamer", "tests", "README.md", "LICENSE"]
