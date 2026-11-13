@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import sys
 
 from . import classify, db, decisions, executor, lint, naming, progress, scan, undo
@@ -105,7 +106,20 @@ def cmd_plan(args):
     return 1 if (problems or findings) else 0
 
 
-def run_ops(conn, run_id, label):
+def command(verb, run_id, db_path=None) -> str:
+    """The command that runs verb on a run, naming the journal when it is not the default."""
+    where = ""
+    if db_path and os.path.abspath(db_path) != os.path.abspath(DEFAULT_DB):
+        where = f" --db {shlex.quote(db_path)}"
+    return f"python3 -m plexrenamer{where} {verb} --run {run_id}"
+
+
+def undo_command(run_id, db_path=None) -> str:
+    """The command that reverses a run."""
+    return command("undo", run_id, db_path)
+
+
+def run_ops(conn, run_id, label, db_path=None):
     """Apply a journalled run. Ctrl-C stops it cleanly and says how to reverse it."""
     db.set_run_status(conn, run_id, "applying")
     try:
@@ -113,7 +127,7 @@ def run_ops(conn, run_id, label):
     except KeyboardInterrupt:
         db.set_run_status(conn, run_id, "interrupted", finished=True)
         print(f"\n\ninterrupted. What ran so far is in the journal; reverse it with:"
-              f"  python3 -m plexrenamer undo --run {run_id}")
+              f"  {undo_command(run_id, db_path)}")
         raise SystemExit(130) from None
     db.set_run_status(conn, run_id, "applied" if not failed else "applied-with-errors",
                       finished=True)
@@ -160,18 +174,31 @@ def cmd_apply(args):
                            args.note)
     db.insert_ops(conn, run_id, ops)
     print(f"run id        : {run_id}\n")
-    ok, failed = run_ops(conn, run_id, "renaming")
+    ok, failed = run_ops(conn, run_id, "renaming", args.db)
     print(f"\ndone: {ok} operations succeeded, {failed} failed")
-    good, bad, verify_problems = executor.verify_run(conn, run_id)
-    print(f"verify: {good} confirmed on disk, {bad} mismatched")
-    for p in verify_problems[:20]:
-        print("  " + p)
+    unread = report_verify(conn, run_id, "verify", 20, args.db)
     if failed:
         for row in db.run_ops(conn, run_id):
             if row["status"] == "failed":
                 print(f"  FAILED {row['kind']} {row['src']} -> {row['dst']}: {row['error']}")
-    print(f"\nreverse this run with:  python3 -m plexrenamer undo --run {run_id}")
-    return 0 if not failed else 1
+    print(f"\nreverse this run with:  {undo_command(run_id, args.db)}")
+    return 0 if not failed and unread is not None else 1
+
+
+def report_verify(conn, run_id, label, shown, db_path=None):
+    """Print what verify finds. Returns the mismatch count, or None when the
+    library could not be read well enough to judge the run."""
+    try:
+        good, bad, problems = executor.verify_run(conn, run_id)
+    except OSError as exc:
+        print(f"{label}: not checked, the library cannot be read right now "
+              f"({type(exc).__name__}: {exc}). Run `{command('verify', run_id, db_path)}` "
+              f"again.")
+        return None
+    print(f"{label}: {good} confirmed on disk, {bad} mismatched")
+    for p in problems[:shown]:
+        print("  " + p)
+    return bad
 
 
 def cmd_undo(args):
@@ -186,13 +213,20 @@ def cmd_undo(args):
     if run is None:
         print(f"no run {run_id}")
         return 1
+    if run["status"] == "undone":
+        # Its rows are settled. Looked at again later, a row that never ran could
+        # be matched to a file that only looks like the one it was to move.
+        print(f"run {run_id} is already undone")
+        return 0
     later = db.standing_runs_after(conn, run_id, run["root"])
     if later and not args.force:
         # a later run may have moved the same files again, and undoing this one
         # first would leave both half reversed
+        # later is newest first, and holds only runs on this library
         print(f"run {run_id} is not the newest: run {', '.join(map(str, later))} "
               f"came after it and still stand{'s' if len(later) == 1 else ''}.\n"
-              f"Undo the newest first (plain `undo` picks it), or pass --force.")
+              f"Undo {'it' if len(later) == 1 else 'them'} first, newest first "
+              f"(`{undo_command(later[0], args.db)}`), or pass --force.")
         return 1
     rows = [r for r in db.run_ops(conn, run_id) if r["status"] != "undone"]
     expected = [r for r in rows if r["status"] in undo.EXPECTED]
@@ -222,7 +256,7 @@ def cmd_undo(args):
             print(f"  ... and {len(notes) - SHOWN} more, each with its reason in the journal")
         print("Rows that failed keep their state: fix the cause and run undo again.\n"
               "To undo an older run although this one is not fully undone, name it with "
-              "--run and add --force.")
+              "--run and add --force. Its rows on paths this run still stands on wait.")
     return 0 if not failed else 1
 
 
@@ -296,12 +330,12 @@ def cmd_prune(args):
     run_id = db.create_run(conn, args.root, args.categories, "prune",
                            args.note or "prune stale directory shells")
     db.insert_ops(conn, run_id, ops)
-    ok, failed = run_ops(conn, run_id, "pruning")
+    ok, failed = run_ops(conn, run_id, "pruning", args.db)
     print(f"\nremoved {ok} directory shells, {failed} failed")
     for row in db.run_ops(conn, run_id):
         if row["status"] == "failed":
             print(f"  kept {row['src']}: {row['error']}")
-    print(f"\nreverse with:  python3 -m plexrenamer undo --run {run_id}")
+    print(f"\nreverse with:  {undo_command(run_id, args.db)}")
     return 0
 
 
@@ -326,11 +360,7 @@ def cmd_verify(args):
     if run_id is None:
         print("no runs recorded")
         return 1
-    good, bad, problems = executor.verify_run(conn, run_id)
-    print(f"run {run_id}: {good} confirmed on disk, {bad} mismatched")
-    for p in problems[:60]:
-        print("  " + p)
-    return 0 if bad == 0 else 1
+    return 0 if report_verify(conn, run_id, f"run {run_id}", 60, args.db) == 0 else 1
 
 
 def main(argv=None):

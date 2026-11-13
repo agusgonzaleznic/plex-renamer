@@ -351,20 +351,25 @@ class UndoSafety(LibraryCase):
     def test_a_lookup_that_fails_once_does_not_write_a_folder_off(self):
         conn, run_id = self._applied()
         created = os.path.dirname(self.dst)
-        real, hiccups = os.lstat, {"n": 0}
+        hiccups = {"n": 0}
 
-        def lstat(path, *args, **kwargs):
-            if path == created and not hiccups["n"]:
-                hiccups["n"] += 1
-                raise OSError(errno.EIO, "the share hiccuped")
-            return real(path, *args, **kwargs)
-        with mock.patch.object(os, "lstat", lstat):
+        def once(real):
+            # The first lookup of the folder fails, whichever call makes it.
+            def look(path, *args, **kwargs):
+                if path == created and not hiccups["n"]:
+                    hiccups["n"] += 1
+                    raise OSError(errno.EIO, "the share hiccuped")
+                return real(path, *args, **kwargs)
+            return look
+        with mock.patch.object(os, "lstat", once(os.lstat)), \
+                mock.patch.object(os, "stat", once(os.stat)):
             _ok, failed = undo.undo_run(conn, run_id, quiet=True)
         self.assertEqual((failed, hiccups["n"]), (1, 1))
         self.assertTrue(os.path.isdir(created))
         row = conn.execute("SELECT * FROM op WHERE run_id=? AND kind='mkdir' AND dst=?",
                            (run_id, created)).fetchone()
         self.assertEqual(row["status"], "done", "a folder that is still there was written off")
+        self.assertIn("hiccuped", row["error"])
         self._assert_restored(conn, run_id)
 
     # -- the share reported an error for a rename that went through ------------
@@ -393,6 +398,27 @@ class UndoSafety(LibraryCase):
         conn.commit()
         self._assert_restored(conn, run_id)
         self.assertEqual(self._movie_row(conn, run_id)["status"], "undone")
+
+    def test_a_row_not_on_record_as_done_does_not_take_back_a_reoccupied_path(self):
+        # The move went through, the journal says it failed (a lost reply) or
+        # never got its mark, and since then the old name is taken again.
+        for status in ("failed", "pending"):
+            self.tearDown()
+            self.setUp()
+            conn, run_id = self._applied()
+            conn.execute("UPDATE op SET status=? WHERE id=?",
+                         (status, self._movie_row(conn, run_id)["id"]))
+            conn.commit()
+            write(self.src)
+            _ok, failed = undo.undo_run(conn, run_id, quiet=True)
+            self.assertEqual(failed, 2, f"{status}: the rename, and the folder it could not leave")
+            self.assertEqual((read(self.src), read(self.dst)), (FOREIGN, "h" * 32), status)
+            row = self._movie_row(conn, run_id)
+            self.assertEqual(row["status"], status, "a row that failed must stay to be retried")
+            self.assertIn("reoccupied", row["error"], status)
+            os.remove(self.src)
+            self._assert_restored(conn, run_id)
+            conn.close()
 
 
 class MetadataNames(LibraryCase):

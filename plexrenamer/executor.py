@@ -1,205 +1,53 @@
-"""Apply a plan. Reversing one is in undo.py.
+"""Apply a plan. Reversing one is in undo.py, expanding one into operations in ops.py.
 
-Ordering rules:
-  1. every destination directory is created first (recorded, so undo can remove it)
-  2. file moves run in an order that never overwrites a file that still has to move
-  3. genuine cycles are broken with a temporary name, recorded as two moves
-  4. directories we emptied are removed last, deepest first, and recreated on undo
-  5. the journal is written ahead of the disk: the whole plan is in it before the
-     first op, and an op is marked "started" and committed before it runs, then
-     "done" or "failed"
+The journal is written ahead of the disk: the whole plan is in it before the
+first operation, and an operation is marked "started" and committed before it
+runs, then "done" or "failed".
 
-Nothing in the library is ever deleted. The only things removed are directories
-this tool emptied or created.
+The tool deletes nothing in the library. The only things it removes there are
+empty directories: a listing must show one empty, and no "._" file of its name
+may sit beside it, which is where some volumes keep a folder's attributes. The
+speed test removes only the scratch files it wrote into a new folder of its
+own, and then that folder, unless something else is in it.
+
+A path that cannot be looked up is never read as a path that is free or gone.
+Only "no such file" means that. Any other error stops the operation in hand.
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import re
-import shutil
 import stat
+import tempfile
 import time
-from dataclasses import dataclass
 
 from . import db
+from .ops import TEMP_SUFFIX, Op, PlanError, build_ops, validate  # noqa: F401
 from .progress import Progress
 
-TEMP_SUFFIX = ".plexrenamer-tmp"
 # Folder metadata the OS writes by itself. It never counts as content, and it is
 # never deleted: when its folder has to go it moves up to the parent.
 METADATA_RE = re.compile(r"(?:\.DS_Store|Thumbs\.db)(?:-\d+)?")
 # The reason on a journal row that was added while the run was under way.
 METADATA_MOVE = "folder metadata moved up, its folder is removed"
+# How the note on a rename that was refused before os.rename was called begins.
+# Such a rename never touched the disk, and undo leaves it be.
+NOT_TRIED = "not tried: "
 
 
-@dataclass
-class Op:
-    seq: int
-    kind: str          # mkdir | rename | rmdir
-    src: str | None
-    dst: str | None
-    is_dir: bool
-    size: int
-    inode: int
-    category: str
-    reason: str
+class Unconfirmed(Exception):
+    """os.rename itself was called and raised.
 
-
-class PlanError(Exception):
-    pass
-
-
-def validate(moves):
-    """Reject anything that could lose data before a single rename happens."""
-    problems = []
-    by_dst = {}
-    srcs = set()
-    for m in moves:
-        if m.src in srcs:
-            problems.append(f"source listed twice: {m.src}")
-        srcs.add(m.src)
-        by_dst.setdefault(m.dst, []).append(m.src)
-    for dst, sources in by_dst.items():
-        if len(sources) > 1:
-            problems.append("collision: " + " + ".join(sources) + f"  ->  {dst}")
-    for m in moves:
-        if not os.path.lexists(m.src):
-            problems.append(f"source vanished: {m.src}")
-        if os.path.lexists(m.dst) and m.dst not in srcs and os.path.normpath(
-                m.dst) != os.path.normpath(m.src):
-            problems.append(f"destination already occupied: {m.dst}")
-    return problems
-
-
-def build_ops(moves, boundaries=(), extra_prunes=()):
-    """Expand moves into the flat, ordered, reversible op list.
-
-    `boundaries` are the only directories whose interior may be pruned. Nothing
-    at or above a boundary is ever removed, so a run can never climb out of the
-    library and remove the volume root.
+    Only then can a rename have gone through although it reported an error,
+    which is what a lost reply from a network share looks like. An operation
+    that was refused before the call has not touched the disk.
     """
-    srcs = {m.src for m in moves}
-    existing_dirs = set()
-    needed_dirs = []
-    for m in moves:
-        parent = os.path.dirname(m.dst)
-        chain = []
-        while parent and not os.path.isdir(parent) and parent not in existing_dirs:
-            chain.append(parent)
-            existing_dirs.add(parent)
-            parent = os.path.dirname(parent)
-        needed_dirs.extend(reversed(chain))
 
-    ops, seq = [], 0
-    for path in needed_dirs:
-        seq += 1
-        ops.append(Op(seq, "mkdir", None, path, True, 0, 0, "", "create destination"))
-
-    pending = list(moves)
-    done_srcs = set()
-    tail = []
-    temp_n = 0
-    while pending:
-        progressed = False
-        deferred = []
-        for m in pending:
-            blocked = (os.path.lexists(m.dst) and m.dst not in done_srcs
-                       and m.dst in srcs)
-            if blocked:
-                deferred.append(m)
-                continue
-            seq += 1
-            ops.append(Op(seq, "rename", m.src, m.dst, m.is_dir, m.size, m.inode,
-                          m.category, m.reason))
-            done_srcs.add(m.src)
-            progressed = True
-        if not deferred:
-            break
-        if not progressed:
-            # a genuine cycle: stage one member through a temporary name
-            victim = deferred.pop(0)
-            temp_n += 1
-            tmp = f"{victim.src}{TEMP_SUFFIX}{temp_n}"
-            seq += 1
-            ops.append(Op(seq, "rename", victim.src, tmp, victim.is_dir, victim.size,
-                          victim.inode, victim.category, "cycle break"))
-            # the second leg has to wait until whatever occupies the destination
-            # has moved out, so it is appended after every ordinary move
-            tail.append((tmp, victim))
-            done_srcs.add(victim.src)
-            srcs.discard(victim.src)
-        pending = deferred
-
-    for tmp, victim in tail:
-        seq += 1
-        ops.append(Op(seq, "rename", tmp, victim.dst, victim.is_dir, victim.size,
-                      victim.inode, victim.category, victim.reason))
-
-    prunable = _prunable_dirs(moves, {o.dst for o in ops if o.kind == "mkdir"},
-                              boundaries)
-    for extra in extra_prunes:
-        if extra not in prunable and _inside(extra, boundaries) \
-                and os.path.isdir(extra):
-            prunable.append(extra)
-    prunable.sort(key=lambda p: p.count(os.sep), reverse=True)
-    for path in prunable:
-        seq += 1
-        ops.append(Op(seq, "rmdir", path, None, True, 0, 0, "", "emptied by this run"))
-    return ops
-
-
-def _inside(path: str, boundaries) -> bool:
-    path = os.path.normpath(path)
-    for b in boundaries:
-        b = os.path.normpath(b)
-        if path != b and path.startswith(b + os.sep):
-            return True
-    return False
-
-
-def _prunable_dirs(moves, created, boundaries=()):
-    """Source directories this run will empty, deepest first.
-
-    Only directories strictly inside a boundary are ever considered, so the
-    walk cannot reach the library root, /Volumes, or /.
-    """
-    if not boundaries:
-        return []
-    touched = set()
-    for m in moves:
-        d = os.path.dirname(m.src)
-        while d and d not in touched and _inside(d, boundaries):
-            touched.add(d)
-            d = os.path.dirname(d)
-    leaving = {}
-    for m in moves:
-        leaving.setdefault(os.path.dirname(m.src), 0)
-        leaving[os.path.dirname(m.src)] += 1
-    # never prune a directory that still holds something after the run
-    keep = set()
-    for m in moves:
-        d = os.path.dirname(m.dst)
-        while d and d not in keep:
-            keep.add(d)
-            d = os.path.dirname(d)
-
-    candidates = []
-    for d in touched:
-        if d in created or d in keep or not os.path.isdir(d) \
-                or not _inside(d, boundaries):
-            continue
-        try:
-            entries = [e for e in os.listdir(d) if e not in {".DS_Store"}]
-        except OSError:
-            continue
-        remaining = [e for e in entries
-                     if os.path.join(d, e) not in {m.src for m in moves}]
-        if remaining and not all(os.path.isdir(os.path.join(d, e)) for e in remaining):
-            continue
-        candidates.append(d)
-    return sorted(candidates, key=lambda p: p.count(os.sep), reverse=True)
+    def __init__(self, cause: OSError):
+        super().__init__(f"{type(cause).__name__}: {cause}")
 
 
 def apply_ops(conn, run_id: int, label: str = "apply", quiet: bool = False):
@@ -226,20 +74,18 @@ def apply_ops(conn, run_id: int, label: str = "apply", quiet: bool = False):
             elif row["kind"] == "rename":
                 _refuse_changed(row)
             _do(row["kind"], row["src"], row["dst"], row["inode"] if keeps is not False else 0)
+        except Exception as exc:                      # noqa: BLE001
+            status, note = _outcome(row, keeps, exc)
+        else:
+            status, note = "done", None
             if keeps is None and row["kind"] == "rename" and row["inode"]:
                 keeps = _kept_number(row)
-            db.mark_op(conn, row["id"], "done")
-            ok += 1
-        except Exception as exc:                      # noqa: BLE001
-            if row["kind"] == "rename" and _took_effect(row, keeps):
-                # a network share can report an error for a rename that went
-                # through, when the reply is lost
-                db.mark_op(conn, row["id"], "done",
-                           f"took effect although it reported {type(exc).__name__}: {exc}")
-                ok += 1
-            else:
-                db.mark_op(conn, row["id"], "failed", f"{type(exc).__name__}: {exc}")
-                failed += 1
+        # Only what the operation itself raised is judged above. A mark that
+        # cannot be written stops the run, and the row stays on record as
+        # started, which undo settles by looking at the disk.
+        db.mark_op(conn, row["id"], status, note)
+        ok += status != "failed"
+        failed += status == "failed"
         conn.commit()
         if bar:
             bar.step(1, os.path.basename(row["dst"] or row["src"] or ""))
@@ -248,25 +94,66 @@ def apply_ops(conn, run_id: int, label: str = "apply", quiet: bool = False):
     return ok, failed
 
 
+def _outcome(row, keeps, exc) -> tuple:
+    """The status and the note for a row whose operation raised.
+
+    A network share can report an error for a rename that went through, when the
+    reply is lost. That is asked only when os.rename itself raised. A rename that
+    was refused before the call cannot have happened, and asking the disk about
+    it would take another file for the one this row was to move. Its note says
+    so, for undo. A folder the run was to make that is already there is not the
+    run's: made since the plan, or missed then by a lookup that failed.
+    """
+    if not isinstance(exc, Unconfirmed):
+        if row["kind"] == "mkdir" and isinstance(exc, FileExistsError):
+            return "undone", f"already there, not made by this run: {row['dst']}"
+        note = f"{type(exc).__name__}: {exc}"
+        return "failed", NOT_TRIED + note if row["kind"] == "rename" else note
+    if row["kind"] == "rename":
+        try:
+            if _took_effect(row, keeps):
+                return "done", f"took effect although it reported {exc}"
+        except OSError as lookup:
+            return "failed", (f"{exc}, and whether it took effect could not be read "
+                              f"({type(lookup).__name__}: {lookup})")
+    return "failed", str(exc)
+
+
+def _look(path: str):
+    """The lstat of path, or None when it is not there.
+
+    Only "no such file" means not there. os.path.lexists and os.path.isdir turn
+    every error into False, and on a network share an error can be a hiccup. A
+    hiccup must never be read as a file or folder that is gone, so it is raised.
+    """
+    try:
+        return os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def exists(path: str) -> bool:
+    """Whether anything is at path. A lookup error is raised, never read as no."""
+    return _look(path) is not None
+
+
+def is_dir(path: str) -> bool:
+    """Whether path is a directory itself, not a link to one. A lookup error is
+    raised, never read as no."""
+    st = _look(path)
+    return st is not None and stat.S_ISDIR(st.st_mode)
+
+
 def holds(path: str, inode: int) -> bool:
-    """True when path exists and is the very file or folder with that inode."""
+    """True when path exists and is the very file or folder with that inode.
+
+    A lookup error counts as not proven, which is the cautious answer wherever
+    this is asked.
+    """
     try:
         return db.inode_of(os.lstat(path)) == inode
     except OSError:
         return False
-
-
-def exists(path: str) -> bool:
-    """Like os.path.lexists, except that only "no such file" means it is not there.
-
-    lexists turns every error into False. On a network share an error can be a
-    hiccup, and a hiccup must never be read as a file or folder that is gone.
-    """
-    try:
-        os.lstat(path)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    return True
 
 
 def located(path: str, row, stale: bool) -> bool:
@@ -276,9 +163,8 @@ def located(path: str, row, stale: bool) -> bool:
     the journal's numbers still tell files apart, and `stale` says that they no
     longer do.
     """
-    try:
-        st = os.lstat(path)
-    except (FileNotFoundError, NotADirectoryError):
+    st = _look(path)
+    if st is None:
         return False
     if bool(row["is_dir"]) != stat.S_ISDIR(st.st_mode):
         return False
@@ -299,15 +185,17 @@ def inodes_are_stale(rows) -> bool:
     Only when no row is, the rows whose file is at its source do. A file at its
     source proves less, because a number worked out from the path is always
     the recorded one there.
+
+    A path that cannot be looked up raises. Skipping it could hand the decision
+    to the weaker evidence, and that answer steers every row of the run.
     """
     for end in ("dst", "src"):
         found = matched = 0
         for row in rows:
             if row["kind"] != "rename" or not row["inode"] or row["status"] == "undone":
                 continue
-            try:
-                st = os.lstat(row[end])
-            except OSError:
+            st = _look(row[end])
+            if st is None:
                 continue
             if bool(row["is_dir"]) != stat.S_ISDIR(st.st_mode):
                 continue
@@ -329,9 +217,10 @@ def _took_effect(row, keeps) -> bool:
     The inode proves that it is that file. On a volume that has shown that a
     moved file gets another number (`keeps` is False), its kind and size have
     to. Without a recorded inode, or without a size where the number cannot be
-    asked, nothing is proven.
+    asked, nothing is proven. A lookup error is raised: the caller records the
+    rename as failed, and undo settles it by the disk.
     """
-    if not row["inode"] or os.path.lexists(row["src"]):
+    if not row["inode"] or exists(row["src"]):
         return False
     if keeps is False:
         return bool(row["size"]) and located(row["dst"], row, stale=True)
@@ -354,11 +243,11 @@ def _refuse_changed(row) -> None:
     A file that has grown or been replaced since the plan was made stays where it
     is. Moving it would put a file into the journal that undo could not find
     again, because undo knows a file by its name, kind and size. A source that
-    is not there at all is left for the rename itself to report.
+    is not there at all is left for the rename itself to report. A file planned
+    at 0 bytes has no size to compare, so it is checked by kind alone.
     """
-    try:
-        st = os.lstat(row["src"])
-    except OSError:
+    st = _look(row["src"])
+    if st is None:
         return
     if bool(row["is_dir"]) != stat.S_ISDIR(st.st_mode):
         raise PlanError(f"no longer a {'folder' if row['is_dir'] else 'file'}: {row['src']}")
@@ -368,13 +257,51 @@ def _refuse_changed(row) -> None:
 
 
 def free_name(parent: str, name: str) -> str:
-    """A metadata name not yet taken in parent: .DS_Store, .DS_Store-1, ..."""
+    """A metadata name not yet taken in parent: .DS_Store, .DS_Store-1, ...
+
+    A name that cannot be looked up raises. Read as free, it would let the
+    rename that follows replace the parent's own metadata.
+    """
     base = re.sub(r"-\d+$", "", name)
     target, n = os.path.join(parent, base), 0
-    while os.path.lexists(target):
+    while exists(target):
         n += 1
         target = os.path.join(parent, f"{base}-{n}")
     return target
+
+
+def keep_attributes(path: str) -> None:
+    """Refuse to remove a folder that has a "._" file of its name beside it.
+
+    A volume without extended attributes of its own (FAT, exFAT, some network
+    shares) keeps a folder's attributes in such a file, and macOS deletes that
+    file together with the folder. A listing of the folder does not show it.
+    """
+    beside = os.path.join(os.path.dirname(path), "._" + os.path.basename(path))
+    if exists(beside):
+        raise PlanError(f"{os.path.basename(beside)} beside it would go with it, "
+                        f"left in place: {path}")
+
+
+def remove_empty(path: str) -> None:
+    """Remove a directory, and only one that a listing shows to be empty.
+
+    rmdir alone is no guard. A system can remove a directory together with files
+    it regards as disposable: macOS does so with one that holds only "._" files,
+    and with the "._" file beside it that holds the folder's attributes. So the
+    directory is listed first, and anything in it keeps it, as does such a file.
+    """
+    if not is_dir(path):
+        return
+    if os.listdir(path):
+        raise PlanError(f"not empty, left in place: {path}")
+    keep_attributes(path)
+    try:
+        os.rmdir(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+            raise PlanError(f"not empty, left in place: {path}") from exc
+        raise
 
 
 def _lift_metadata(conn, run_id: int, directory: str) -> None:
@@ -384,13 +311,15 @@ def _lift_metadata(conn, run_id: int, directory: str) -> None:
     being removed. It moves up to the parent, and that move goes into the journal
     as a rename of its own, written before it happens, so undo brings it back.
     Nothing moves when the directory holds anything else: it stays as it is and
-    the rmdir reports that it was not empty.
+    the rmdir reports that it was not empty. Nothing moves either when the
+    directory is to stay for the "._" file beside it.
     """
-    if not os.path.isdir(directory):
+    if not is_dir(directory):
         return
     names = sorted(os.listdir(directory))
     if not names or not all(METADATA_RE.fullmatch(name) for name in names):
         return
+    keep_attributes(directory)
     parent = os.path.dirname(directory)
     for name in names:
         src = os.path.join(directory, name)
@@ -407,32 +336,32 @@ def _lift_metadata(conn, run_id: int, directory: str) -> None:
 
 def _do(kind: str, src, dst, inode):
     if kind == "mkdir":
-        os.makedirs(dst, exist_ok=True)
+        os.mkdir(dst)                   # a folder already there raises: it is not the run's
         return
     if kind == "rmdir":
-        if not os.path.isdir(src):
-            return
-        try:
-            os.rmdir(src)
-        except OSError as exc:
-            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
-                raise PlanError(f"not empty, left in place: {src}") from exc
-            raise
+        remove_empty(src)
         return
-    if not os.path.lexists(src):
+    if not exists(src):
         raise FileNotFoundError(src)
     if inode:
         actual = db.inode_of(os.lstat(src))
         if actual != inode:
             raise PlanError(f"inode changed for {src}: expected {inode}, saw {actual}")
-    if os.path.lexists(dst):
+    if exists(dst):
         raise PlanError(f"destination occupied: {dst}")
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    os.rename(src, dst)
+    try:
+        os.rename(src, dst)
+    except OSError as exc:
+        raise Unconfirmed(exc) from exc
 
 
 def verify_run(conn, run_id: int):
-    """Confirm on-disk reality matches the journal."""
+    """Confirm on-disk reality matches the journal.
+
+    Raises OSError when the library cannot be read well enough to judge the run
+    as a whole. A single row that cannot be read counts as a mismatch.
+    """
     good = bad = 0
     problems = []
     rows = db.run_ops(conn, run_id)
@@ -447,43 +376,58 @@ def verify_run(conn, run_id: int):
     for row in rows:
         if row["status"] != "done":
             continue
-        if row["kind"] == "rename":
-            if moved_on.get(row["dst"], 0) > row["seq"]:
-                good += 1
-            elif not exists(row["dst"]):
-                problems.append(f"missing destination: {row['dst']}")
-                bad += 1
-            elif not located(row["dst"], row, stale):
-                problems.append(f"not what the run moved there: {row['dst']}")
-                bad += 1
-            else:
-                good += 1
-        elif row["kind"] == "mkdir" and not os.path.isdir(row["dst"]):
-            problems.append(f"missing directory: {row['dst']}")
+        try:
+            problem = _mismatch(row, moved_on, stale)
+        except OSError as exc:
+            problem = f"cannot be read ({type(exc).__name__}: {exc}): {row['dst']}"
+        if problem:
+            problems.append(problem)
             bad += 1
+        elif row["kind"] == "rename":
+            good += 1
     return good, bad, problems
 
 
+def _mismatch(row, moved_on, stale):
+    """What is wrong on disk with a row the journal has as done, or None."""
+    if row["kind"] == "rename":
+        if moved_on.get(row["dst"], 0) > row["seq"]:
+            return None
+        if not exists(row["dst"]):
+            return f"missing destination: {row['dst']}"
+        if not located(row["dst"], row, stale):
+            return f"not what the run moved there: {row['dst']}"
+    elif row["kind"] == "mkdir" and not is_dir(row["dst"]):
+        return f"missing directory: {row['dst']}"
+    return None
+
+
 def benchmark(volume_root: str, samples: int = 60) -> float:
-    """Measure rename throughput on the target filesystem, in ops/second."""
-    scratch = os.path.join(volume_root, ".plexrenamer-benchmark")
-    os.makedirs(scratch, exist_ok=True)
+    """Measure rename throughput on the target filesystem, in ops/second.
+
+    It works in a folder of its own, made new under a name no other folder has,
+    and removes only what it made there: its scratch files, then the folder.
+    Anything else that turns up in the folder keeps it.
+    """
+    scratch = tempfile.mkdtemp(prefix=".plexrenamer-benchmark-", dir=volume_root)
+    made = []
     try:
-        paths = []
         for i in range(samples):
             p = os.path.join(scratch, f"bench-{i:03d}")
-            with open(p, "w") as fh:
+            with open(p, "x") as fh:
                 fh.write("x")
-            paths.append(p)
+            made.append(p)
         start = time.time()
-        for p in paths:
+        for p in made:
             os.rename(p, p + ".moved")
-        for p in paths:
+        for p in made:
             os.rename(p + ".moved", p)
         elapsed = time.time() - start
-        rate = (samples * 2) / elapsed if elapsed > 0 else 500.0
-        for p in paths:
-            os.remove(p)
-        return rate
+        return (samples * 2) / elapsed if elapsed > 0 else 500.0
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        for p in made:
+            for name in (p, p + ".moved"):
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(name)
+        with contextlib.suppress(OSError, PlanError):
+            remove_empty(scratch)

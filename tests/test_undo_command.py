@@ -47,6 +47,7 @@ class UndoCommand(LibraryCase):
         late = "Movies/Hollow Tide (2021) [1080p] [WEBRip] [YTS.MX]/Hollow.Tide.2021.1080p.mp4"
         os.makedirs(os.path.dirname(os.path.join(self.root, late)))
         write(os.path.join(self.root, late), "z" * 32)
+        written = snapshot(self.root)[late]
         self.assertEqual(self._cli("apply", "--rate", "5000")[0], 0)
         applied = snapshot(self.root)
         code, out = self._cli("undo", "--run", "1")
@@ -59,7 +60,7 @@ class UndoCommand(LibraryCase):
             self.assertIn(expected, out)
         self.assertIn("nothing to undo", self._cli("undo")[1])
         after = snapshot(self.root)
-        self.assertEqual(after.pop(late), snapshot(self.root)[late])
+        self.assertEqual(after.pop(late), written)
         self.assertEqual(after, self.before)
         self.assertEqual((self._run_status(1), self._run_status(2)), ("undone", "undone"))
 
