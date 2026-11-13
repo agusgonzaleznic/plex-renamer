@@ -352,6 +352,66 @@ def strip_release_tail(name: str) -> str:
     return out or name.strip(" -_.")
 
 
+BRACKETS = {"(": ")", "[": "]", "{": "}"}
+OPENER_OF = {c: o for o, c in BRACKETS.items()}
+SEPARATORS = " -._"
+
+
+def _partners(text: str) -> dict:
+    """Each bracket in text that has a partner, mapped to the partner's position."""
+    open_at, partner = [], {}
+    for i, ch in enumerate(text):
+        if ch in BRACKETS:
+            open_at.append(i)
+        elif ch in OPENER_OF and open_at and text[open_at[-1]] == OPENER_OF[ch]:
+            j = open_at.pop()
+            partner[i], partner[j] = j, i
+    return partner
+
+
+def _trim_start(text: str) -> str:
+    if not text or (text[0] not in BRACKETS and text[0] not in OPENER_OF):
+        return text
+    end = _partners(text).get(0)
+    if end is None:
+        return text[1:]
+    if not any(c.isalnum() for c in text[1:end]):
+        return text[end + 1:]
+    return text[0] + text[1:].lstrip(SEPARATORS)
+
+
+def _trim_end(text: str) -> str:
+    if not text or (text[-1] not in BRACKETS and text[-1] not in OPENER_OF):
+        return text
+    start = _partners(text).get(len(text) - 1)
+    if start is None:
+        return text[:-1]
+    if not any(c.isalnum() for c in text[start + 1:-1]):
+        return text[:start]
+    return text[:-1].rstrip(SEPARATORS) + text[-1]
+
+
+def trim_ends(text: str) -> str:
+    """Trim separators and brackets off both ends of a title, never its inside.
+
+    A bracket goes when it has no partner, a pair when it holds no letter or
+    digit, and separators just inside a pair that stays: "Glazing (Cont'd)"
+    keeps its ")". The inside stays as it is because a course lesson is
+    written as it was found, and the name must read back the same.
+    """
+    while True:
+        before = text
+        text = _trim_end(_trim_start(text.strip(SEPARATORS)).strip(SEPARATORS))
+        if text == before:
+            return text
+
+
+def _capitalise(word: str) -> str:
+    """Capitalise the first letter after any opening bracket: "(live" gives "(Live"."""
+    lead = len(word) - len(word.lstrip("([{"))
+    return word[:lead] + word[lead:].capitalize()
+
+
 def smart_title(text: str) -> str:
     """Title-case only when the source is shouting; otherwise leave casing alone."""
     letters = [c for c in text if c.isalpha()]
@@ -361,7 +421,7 @@ def smart_title(text: str) -> str:
         words = text.lower().split()
         out = []
         for i, w in enumerate(words):
-            out.append(w if (0 < i < len(words) - 1 and w in small) else w.capitalize())
+            out.append(w if (0 < i < len(words) - 1 and w in small) else _capitalise(w))
         return " ".join(out)
     return text
 

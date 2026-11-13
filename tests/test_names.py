@@ -74,6 +74,87 @@ class Titles(unittest.TestCase):
         self.assertTitle("Hollow Tide", "Hollow Tide", None)
 
 
+class EpisodeTitles(unittest.TestCase):
+    """An episode title loses only what holds nothing at its ends: separators, a
+    bracket without its partner, an empty pair, what is left of a year. A pair
+    that holds text stays and the inside is left as it is, so every name the
+    tool wrote reads back the same."""
+
+    KEPT = ("Glazing (Cont'd)", "Kilns (Advanced)", "Intro [Live]", "Part (1)",
+            "The (Very) Long Title", "(Cont'd) Part Two", "(Bonus) Extra",
+            "Kilns ( Part 2 ) Basics", "Glazing () Basics", "Clay [ Wet ] Work", "(1) Intro")
+    TRIMMED = (("Title (2019)", "Title"), ("Title [2019]", "Title"), ("Title ()", "Title"),
+               ("([2019]) Title", "Title"),
+               ("Title (2019", "Title"), ("Episode ([2019])", "Episode"),
+               ("Episode [{2019}]", "Episode"), ("(Orphan", "Orphan"), ("Orphan)", "Orphan"),
+               ("((Orphan", "Orphan"), ("Orphan))", "Orphan"), ("Title [(", "Title"),
+               ("Title ) (", "Title"), (") Title", "Title"), ("Title (a]", "Title (a"),
+               ("(Bonus) Extra)", "(Bonus) Extra"), ("(Live (Cont'd)", "Live (Cont'd)"),
+               ("(- Intro)", "(Intro)"), ("Remastered (Final 2019)", "Remastered (Final)"))
+
+    def title(self, rest):
+        """The title as the planner reads it, which passes the show's title."""
+        return classify.parse_episode(f"Gale Teaches Pottery (2016) - S01E03 - {rest}",
+                                      "Gale Teaches Pottery")[3]
+
+    @staticmethod
+    def plan(root):
+        trees = scan.scan(root, ["Classes", "Series"])
+        planner = Planner(root)
+        return [m for cat in ("Classes", "Series")
+                for u in classify.classify_category(cat, trees[cat])
+                for m in planner.plan_unit(u).moves]
+
+    def test_a_pair_that_holds_text_stays_and_the_inside_is_left_alone(self):
+        for rest in self.KEPT:
+            self.assertEqual(self.title(rest), rest)
+
+    def test_what_holds_nothing_goes_from_the_ends(self):
+        for rest, title in self.TRIMMED:
+            self.assertEqual(self.title(rest), title, rest)
+            self.assertEqual(self.title(title), title, f"{rest} does not read back")
+
+    def test_a_bracket_right_after_the_show_name_stays_with_the_title(self):
+        for rest, title in (("(] Glazing)", "(] Glazing)"), ("( Part 1 )", "(Part 1)"),
+                            ("- ( Kilns )", "(Kilns)")):
+            got = classify.parse_episode(f"Kuro - S01E03 - {rest}", "Kuro")[3]
+            self.assertEqual(got, title, rest)
+            self.assertEqual(classify.parse_episode(f"Kuro - S01E03 - {got}", "Kuro")[3], got)
+        self.assertEqual(classify.parse_episode("Kuro + - S01E03 - Glazing", "Kuro")[3], "Glazing")
+
+    def test_a_shouting_title_is_capitalised_after_a_bracket(self):
+        self.assertEqual(util.smart_title("(LIVE AT THE ARENA)"), "(Live at the Arena)")
+        self.assertEqual(util.smart_title("[LIVE AT THE ARENA]"), "[Live at the Arena]")
+        self.assertEqual(util.smart_title("{LIVE AT THE ARENA}"), "{Live at the Arena}")
+        self.assertEqual(util.smart_title("EL NIÑO (PARTE 1)"), "El Niño (Parte 1)")
+        self.assertEqual(util.smart_title("THE 1ST ONE"), "The 1st One")
+
+    def test_names_planned_from_raw_files_read_back_as_final(self):
+        root = tempfile.mkdtemp(prefix="plexrenamer-episodes-")
+        state = tempfile.mkdtemp(prefix="plexrenamer-episodes-state-")
+        self.addCleanup(shutil.rmtree, root, True)
+        self.addCleanup(shutil.rmtree, state, True)
+        course, show = "Classes/Gale Teaches Pottery (2016)", "Series/Kuro/Season 1"
+        raw = [f"{course}/01 - Introduction.mp4", f"{course}/02 - Glazing (Cont'd).mp4",
+               f"{course}/03 - Kilns ( Part 2 ) Basics.mp4", f"{course}/04 - Glazing () Basics.mp4",
+               f"{show}/S01E01 - Glazing (Cont'd).mkv", f"{show}/S01E02 (- Intro).mkv",
+               f"{show}/S01E03 - (LIVE AT THE ARENA).mkv", f"{show}/S01E04 - Episode ([2019]).mkv"]
+        for n, name in enumerate(raw):
+            path = os.path.join(root, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(f"file {n}")
+        moves = self.plan(root)
+        self.assertEqual(sorted(os.path.relpath(m.src, root) for m in moves), sorted(raw))
+        conn = db.connect(os.path.join(state, "j.db"))
+        self.addCleanup(conn.close)
+        run_id = db.create_run(conn, root, ["Classes", "Series"], "episodes")
+        db.insert_ops(conn, run_id, executor.build_ops(
+            moves, [os.path.join(root, "Classes"), os.path.join(root, "Series")]))
+        self.assertEqual(executor.apply_ops(conn, run_id, quiet=True)[1], 0)
+        self.assertEqual([os.path.basename(m.dst) for m in self.plan(root)], [])
+
+
 class LanguageTags(unittest.TestCase):
     def test_a_locale_form_keeps_its_language(self):
         self.assertEqual(util.normalize_lang("fil-PH"), ("fil", False, False, ""))
