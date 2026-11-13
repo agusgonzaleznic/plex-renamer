@@ -57,6 +57,18 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def inode_of(st) -> int:
+    """The inode number of a stat result, in the form the journal can hold.
+
+    SQLite integers are signed 64-bit, and a network share can number its files
+    above that range, so the upper half wraps to negative. Every inode in this
+    package is read with this function, so two of them are equal exactly when
+    the numbers on disk are. 0 still means that none was recorded.
+    """
+    ino = st.st_ino
+    return ino - (1 << 64) if ino >= (1 << 63) else ino
+
+
 def connect(path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(path, timeout=60)
@@ -87,6 +99,52 @@ def insert_ops(conn, run_id: int, ops) -> None:
         ],
     )
     conn.commit()
+
+
+def append_op(conn, run_id: int, kind: str, src, dst, *, size: int = 0, inode: int = 0,
+              reason: str = "", status: str = "pending") -> int:
+    """Add one op behind the planned ones, for a move that is only known at run time.
+
+    It gets the highest seq of its run, so undo reverses it before anything that
+    was planned. The caller commits.
+    """
+    seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM op WHERE run_id=?",
+                       (run_id,)).fetchone()[0]
+    cur = conn.execute(
+        "INSERT INTO op(run_id, seq, kind, src, dst, is_dir, size, inode, category,"
+        " reason, status, applied_at) VALUES (?,?,?,?,?,0,?,?,'',?,?,?)",
+        (run_id, seq, kind, src, dst, size, inode, reason, status, utcnow()),
+    )
+    return cur.lastrowid
+
+
+def note_op(conn, op_id: int, note: str) -> None:
+    """Record why an op could not be undone. Its status stays, so the next undo
+    tries it again."""
+    conn.execute("UPDATE op SET error=?, undone_at=? WHERE id=?",
+                 (note, utcnow(), op_id))
+
+
+def get_run(conn, run_id: int):
+    return conn.execute("SELECT * FROM run WHERE id=?", (run_id,)).fetchone()
+
+
+# A run still stands when it may have changed the disk and is not fully undone.
+_STANDING = "status NOT IN ('undone', 'planned')"
+
+
+def newest_standing_run(conn):
+    row = conn.execute(
+        f"SELECT id FROM run WHERE {_STANDING} ORDER BY id DESC LIMIT 1").fetchone()
+    return row["id"] if row else None
+
+
+def standing_runs_after(conn, run_id: int, root: str):
+    """Later runs on the same library that are not undone, newest first."""
+    same = os.path.normpath(root)        # "/Volumes/X/" and "/Volumes/X" are one library
+    return [row["id"] for row in conn.execute(
+        f"SELECT id, root FROM run WHERE id > ? AND {_STANDING} ORDER BY id DESC", (run_id,))
+        if os.path.normpath(row["root"]) == same]
 
 
 def set_run_status(conn, run_id: int, status: str, finished: bool = False) -> None:

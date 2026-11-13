@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from . import util
+from . import db, util
 
 
 @dataclass(eq=False)
@@ -93,7 +93,7 @@ def scan(root: str, categories) -> dict:
 def _build(path: str, rel: str, parent) -> Node:
     st = os.lstat(path)
     node = Node(path=path, rel=rel, name=os.path.basename(path), is_dir=True,
-                inode=st.st_ino, parent=parent)
+                inode=db.inode_of(st), parent=parent)
     try:
         entries = sorted(os.scandir(path), key=lambda e: e.name)
     except OSError:
@@ -109,7 +109,7 @@ def _build(path: str, rel: str, parent) -> Node:
                 est = entry.stat(follow_symlinks=False)
                 node.children.append(Node(
                     path=entry.path, rel=child_rel, name=entry.name, is_dir=False,
-                    size=est.st_size, inode=est.st_ino, parent=node))
+                    size=est.st_size, inode=db.inode_of(est), parent=node))
         except OSError:
             continue
     return node
