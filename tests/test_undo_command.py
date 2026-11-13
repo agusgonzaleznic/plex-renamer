@@ -5,7 +5,10 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import shlex
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -13,7 +16,10 @@ from unittest import mock
 from test_roundtrip import CATS, FIXTURE, LibraryCase, dirs, snapshot
 from test_undo_safety import MOVIE, write
 
+import plexrenamer
 from plexrenamer import cli, db, executor
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class UndoCommand(LibraryCase):
     def setUp(self):
@@ -151,6 +157,56 @@ class UndoCommand(LibraryCase):
             self.assertEqual(dirs(self.root), self.before_dirs)
         finally:
             shutil.rmtree(other, ignore_errors=True)
+
+
+class InstalledCommand(unittest.TestCase):
+    """An installed copy keeps its state in the folder it runs from, and says its own name."""
+
+    def test_the_journal_decisions_and_reports_follow_the_working_folder(self):
+        work = tempfile.mkdtemp(prefix="plexrenamer-cwd-")
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        code = (f"import sys; sys.path.insert(0, {REPO!r}); from plexrenamer import cli; "
+                "print(cli.DEFAULT_DB); print(cli.DEFAULT_DECISIONS); print(cli.REPORTS)")
+        out = subprocess.run([sys.executable, "-I", "-c", code], cwd=work, check=True,
+                             capture_output=True, text=True).stdout.splitlines()
+        here = os.path.realpath(work)
+        self.assertEqual(out, [os.path.join(here, "state", "plex-renamer.db"),
+                               os.path.join(here, "decisions"), os.path.join(here, "reports")])
+        self.assertEqual(os.listdir(work), [], "importing the tool wrote into the folder")
+
+    def test_the_installed_command_prints_commands_under_its_own_name(self):
+        relative = os.path.join("state", "j.db")
+        with mock.patch.object(cli, "PROG", cli.PROG), \
+                mock.patch.object(cli, "main", return_value=0) as main:
+            self.assertEqual(plexrenamer.console(), 0)
+            self.assertEqual(cli.undo_command(4), "plex-renamer undo --run 4")
+            self.assertEqual(cli.command("verify", 4, "/x/j.db"),
+                             "plex-renamer --db /x/j.db verify --run 4")
+            # it may run from any folder, so it names even the default journal, in full
+            self.assertEqual(cli.undo_command(4, cli.DEFAULT_DB),
+                             f"plex-renamer --db {shlex.quote(cli.DEFAULT_DB)} undo --run 4")
+            self.assertEqual(cli.undo_command(4, relative), "plex-renamer --db "
+                             f"{shlex.quote(os.path.abspath(relative))} undo --run 4")
+        main.assert_called_once_with()
+        self.assertEqual(cli.undo_command(4), "python3 -m plexrenamer undo --run 4")
+        self.assertEqual(cli.undo_command(4, relative),
+                         f"python3 -m plexrenamer --db {relative} undo --run 4")
+
+    def test_commands_that_read_past_runs_refuse_a_journal_that_is_not_there(self):
+        work = tempfile.mkdtemp(prefix="plexrenamer-nojournal-")
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        os.makedirs(os.path.join(work, "lib", "Movies"))
+        missing = os.path.join(work, "state", "plex-renamer.db")
+        base = ["--root", os.path.join(work, "lib"), "--db", missing, "--categories", "Movies",
+                "--decisions", os.path.join(work, "none")]
+        for verb in (["undo"], ["undo", "--run", "1"], ["verify"], ["status"], ["prune", "--dry-run"]):
+            with self.subTest(verb=verb):
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        self.assertRaises(SystemExit) as caught:
+                    cli.main(base + verb)
+                self.assertIn(f"no journal at {missing}", str(caught.exception.code))
+                self.assertFalse(os.path.exists(os.path.join(work, "state")),
+                                 "a refused command made the journal")
 
 
 if __name__ == "__main__":

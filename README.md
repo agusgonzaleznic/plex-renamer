@@ -127,6 +127,21 @@ section; the code does not read it. Of its 260 rules, 155 are marked
 - **Renames are ordered.** A move whose destination is still occupied by another
   pending move is deferred; a genuine swap is staged through a temporary name.
 
+## Install
+
+```bash
+pipx install plex-renamer          # or: pip install plex-renamer
+```
+
+It needs Python 3.12 or newer and nothing outside the standard library. The
+installed command is `plex-renamer`, with the same sub-commands and flags as
+`python3 -m plexrenamer` below. The journal (`state/`), the decisions and the
+reports live in the folder it runs from, so run it from the same folder every
+time, or point `--db` at the journal.
+
+Each GitHub release carries the wheel and the sdist with a `SHA256SUMS` file;
+`sha256sum -c SHA256SUMS` in the download folder checks them.
+
 ## Usage
 
 ```bash
@@ -229,6 +244,9 @@ real `.DS_Store` files go and nothing that changed since the listing, and that
 reply, after a cut on either side of the delete, after a remount, and never
 over a file that has taken its place.
 
+CI runs them on macOS, on Python 3.12 to 3.15, for every pull request and every
+push to main.
+
 ## Pruning shells left behind by a rename
 
 ```bash
@@ -243,3 +261,12 @@ and left alone. Any folder metadata inside a pruned directory is moved to the
 parent rather than deleted, and `undo` recreates the directory and puts that
 file back. A directory that still holds anything else, `._` files included, is
 kept and reported.
+
+## Releases
+
+A release is a tag `vX.Y.Z` on main that matches `__version__` in
+`plexrenamer/__init__.py`. Pushing it runs `release.yml`: the tests and the
+package build first, then the GitHub release with the wheel, the sdist and
+their `SHA256SUMS`, then the upload of the same files to PyPI through Trusted
+Publishing. The release refuses a tag that is not on main, or that moved after
+the run started.

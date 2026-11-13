@@ -1,0 +1,23 @@
+# Lints the workflows and proves every action pin, on every pull request and push to main, with
+# the shared actions-lint.yml.
+
+name: Lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # "Lint" is half of the main ruleset's required checks ("Lint / actionlint", "Lint / Verify
+  # action pins"): renaming it is a breaking change.
+  lint:
+    name: Lint
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/actions-lint.yml@6c9eab4c9ab0fb867c1f6d5b71658f71f643b2d7 # v1.8.0

@@ -8,3 +8,10 @@ only the scratch files it wrote into a folder of its own.
 """
 
 __version__ = "1.0.0"
+
+
+def console():
+    """The installed plex-renamer command: the commands it prints start with its own name."""
+    from . import cli
+    cli.PROG = "plex-renamer"
+    return cli.main()

@@ -1,0 +1,39 @@
+# Tests on every pull request and every push to main, on macOS, where the tool runs, and the
+# package built as a release builds it. Read-only token; nothing is published. Both run in the
+# shared reusable workflows, pinned to full commit SHAs with the release in a comment; lint.yml
+# proves each pin.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The job names here are half of the main ruleset's required checks ("Tests / Python 3.12",
+  # "Package build / Build sdist and wheel"): renaming one is a breaking change.
+  tests:
+    name: Tests
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/python-tests.yml@6c9eab4c9ab0fb867c1f6d5b71658f71f643b2d7 # v1.8.0
+    with:
+      runs-on: macos-15
+      python-versions: '["3.12", "3.13", "3.14", "3.15"]'
+      # The tool needs only the standard library.
+      install-requirements: false
+      test-command: .venv/bin/python -m unittest discover -s tests
+
+  package:
+    name: Package build
+    # The build release.yml runs, on every change, so a stale requirements/build.txt or a broken
+    # build fails a pull request instead of a release (a v* tag can never move).
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/python-build.yml@6c9eab4c9ab0fb867c1f6d5b71658f71f643b2d7 # v1.8.0
+    with:
+      build-constraints: requirements/build.txt

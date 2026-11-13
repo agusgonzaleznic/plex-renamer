@@ -15,10 +15,13 @@ from .planner import Planner
 CATEGORIES = ["Animated Movies", "Animated Series", "Anime Movies", "Anime Series",
               "Classes", "Documentaries", "DocuSeries", "Movies", "Music Shows",
               "Series", "StandUp", "Theatre"]
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The journal, the decisions and the reports live in the folder the tool runs from: the
+# repository when it runs from source, never the folder an installed copy sits in.
+HERE = os.getcwd()
 DEFAULT_DB = os.path.join(HERE, "state", "plex-renamer.db")
 DEFAULT_DECISIONS = os.path.join(HERE, "decisions")
 REPORTS = os.path.join(HERE, "reports")
+PROG = "python3 -m plexrenamer"     # how printed commands start; console() renames it
 SHOWN = 60          # how many failed rows undo prints before it only counts them
 
 
@@ -109,11 +112,13 @@ def cmd_plan(args):
 
 
 def command(verb, run_id, db_path=None) -> str:
-    """The command that runs verb on a run, naming the journal when it is not the default."""
+    """The command that runs verb on a run, naming the journal when it is not the default. The
+    installed command may run from any folder, so it always names the journal by its full path."""
+    installed = PROG == "plex-renamer"
     where = ""
-    if db_path and os.path.abspath(db_path) != os.path.abspath(DEFAULT_DB):
-        where = f" --db {shlex.quote(db_path)}"
-    return f"python3 -m plexrenamer{where} {verb} --run {run_id}"
+    if db_path and (installed or os.path.abspath(db_path) != os.path.abspath(DEFAULT_DB)):
+        where = f" --db {shlex.quote(os.path.abspath(db_path) if installed else db_path)}"
+    return f"{PROG}{where} {verb} --run {run_id}"
 
 
 def undo_command(run_id, db_path=None) -> str:
@@ -269,7 +274,7 @@ def report_verify(conn, run_id, label, shown, db_path=None):
 
 
 def cmd_undo(args):
-    conn = db.connect(args.db)
+    conn = db.connect(args.db, create=False)
     run_id = args.run
     if run_id is None:
         run_id = db.newest_standing_run(conn)
@@ -365,7 +370,7 @@ def cmd_prune(args):
             while d and d.startswith(args.root):
                 protected.add(d)
                 d = os.path.dirname(d)
-    conn_read = db.connect(args.db)
+    conn_read = db.connect(args.db, create=False)
     emptied = set()
     for row in conn_read.execute(
             "SELECT src FROM op WHERE kind='rename' AND status='done'"):
@@ -408,7 +413,7 @@ def cmd_prune(args):
 
 
 def cmd_status(args):
-    conn = db.connect(args.db)
+    conn = db.connect(args.db, create=False)
     rows = conn.execute("SELECT * FROM run ORDER BY id DESC LIMIT 20").fetchall()
     if not rows:
         print("no runs recorded")
@@ -423,7 +428,7 @@ def cmd_status(args):
 
 
 def cmd_verify(args):
-    conn = db.connect(args.db)
+    conn = db.connect(args.db, create=False)
     run_id = args.run or (db.latest_run(conn) or {"id": None})["id"]
     if run_id is None:
         print("no runs recorded")
@@ -453,7 +458,7 @@ def _close_category_list(argv, commands):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser("plexrenamer", description=__doc__)
+    ap = argparse.ArgumentParser(PROG, description=__doc__)
     ap.add_argument("--root", default="/Volumes/Multimedia")
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--decisions", default=DEFAULT_DECISIONS)

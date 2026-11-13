@@ -1,0 +1,81 @@
+# Releases plex-renamer from a version tag vX.Y.Z on main. The tests and the package build run
+# first; then the GitHub release is published with the built files and their SHA256SUMS, from
+# the trunk only; then the same files go to PyPI through Trusted Publishing. PyPI trusts this
+# file (release.yml) running in the GitHub environment pypi, which accepts only v* tags, so the
+# workflow uses no PyPI token.
+#
+# Tests, build and GitHub release run in the shared reusable workflows. The upload has to stay in
+# this file: PyPI only trusts a job defined in the workflow file registered with it, never one
+# from another repository's reusable workflow (pypi/warehouse#11096). Actions are pinned to full
+# commit SHAs, with the release in a comment.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions: {}
+
+# One release at a time: a tag pushed while a release runs waits for it. GitHub keeps only the
+# newest waiting run of a group and cancels an older one, so push one tag at a time.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Tests
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/python-tests.yml@6c9eab4c9ab0fb867c1f6d5b71658f71f643b2d7 # v1.8.0
+    permissions:
+      contents: read
+    with:
+      runs-on: macos-15
+      python-versions: '["3.12", "3.13", "3.14", "3.15"]'
+      install-requirements: false
+      test-command: .venv/bin/python -m unittest discover -s tests
+
+  # Fails when the tag differs from the version in plexrenamer/__init__.py.
+  build:
+    name: Package build
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/python-build.yml@6c9eab4c9ab0fb867c1f6d5b71658f71f643b2d7 # v1.8.0
+    permissions:
+      contents: read
+    with:
+      build-constraints: requirements/build.txt
+
+  # Refuses a tag that is not on main, or that moved since the run started.
+  release:
+    name: Release
+    needs: [tests, build]
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/github-release.yml@6c9eab4c9ab0fb867c1f6d5b71658f71f643b2d7 # v1.8.0
+    permissions:
+      contents: write
+    with:
+      artifact-name: python-dist
+
+  publish:
+    name: Publish to PyPI
+    needs: [build, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/plex-renamer/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the built files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-dist
+          path: dist/
+
+      # A short-lived token from Trusted Publishing, and signed attestations for both files;
+      # there is no password input on purpose. The workflow at a tag never changes, so a re-run
+      # of this job must be able to finish an upload that stopped after the first file.
+      - name: Upload to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true
