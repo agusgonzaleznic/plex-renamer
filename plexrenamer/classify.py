@@ -302,14 +302,28 @@ def build_info(kind: str, raw_name: str, videos, category: str):
             ids[prov] = m.group(1)
     _, explicit = util.explicit_edition(raw_name)
     year = util.extract_year(raw_name)
-    title = util.clean_title(raw_name)
+    name = util.normalize_separators(util.strip_site_prefix(raw_name))
+    # What follows the year is release information ("[RETAIL]", "EXTENDED 1080p
+    # ..."), never title, so the title is read from what stands before it.
+    # Only an edition is worth keeping from the rest. The year itself stays on
+    # while cleaning: it is what tells "The Example Limited (2007)" from a name
+    # that ends in a release flag.
+    head, tail = util.split_at_year(name)
+    if head is None:
+        head, tail = name, ""
+    else:
+        head = f"{head.rstrip()} ({year})"
+    title = util.clean_title(head)
     if year:
         title = re.sub(rf"\s*\(?{year}\)?\s*", " ", title).strip(" -._")
     title = re.sub(r"\{[^}]*\}", " ", title)
     title = util.SXXEXX_RE.sub(" ", title)
     title, editions = util.extract_editions(title)
+    _, after_year = util.extract_editions(re.sub(r"[\[\]]", " ", util.clean_title(tail)))
+    editions += [e for e in after_year if e not in editions]
     if explicit:
         editions = [explicit]
+    title = re.sub(r"[\[(]\s*[\])]", " ", title)     # brackets an edition left empty
     title = re.sub(r"\s+", " ", title).strip(" -._")
     if year is None and videos:
         for v in videos:

@@ -16,7 +16,7 @@ from .classify import (Unit, is_dvd_dir, is_extras_dir, is_subtitle_dir,
                        is_support_dir, parse_episode, season_number)
 from .scan import Node, is_junk
 from .sidecars import (PART_RE, _dedupe, _free_path, _hidden, _label,
-                       _sub_flavour, _unique_subtitle)
+                       _sub_flavour, _sub_language, _unique_subtitle)
 
 @dataclass
 class Move:
@@ -272,8 +272,7 @@ class Planner:
             if child.is_subtitle and match:
                 src_stem, dest_stem, dest_dir = match
                 lang, forced, sdh, leftover = _sub_flavour(child.stem, src_stem)
-                if lang is None:
-                    lang = "en"
+                lang, leftover = _sub_language(lang, leftover)
                 used = used_by_dir.setdefault(dest_dir, {})
                 name = _unique_subtitle(used, dest_stem, lang, forced, sdh,
                                         leftover, child.ext, child.name)
@@ -415,9 +414,7 @@ class Planner:
                 return
             src_stem, stem = match
             lang, forced, sdh, leftover = _sub_flavour(child.stem, src_stem or stem)
-            if lang is None:
-                # Plex ignores a sidecar with no language code, so always emit one
-                lang = "en"
+            lang, leftover = _sub_language(lang, leftover)
             name = _unique_subtitle(used, stem, lang, forced, sdh, leftover,
                                     child.ext, child.name)
             self._add(plan, child, os.path.join(dest_dir, name), "subtitle")
@@ -479,8 +476,7 @@ class Planner:
             if child.is_subtitle and default_stem:
                 lang, forced, sdh, leftover = _sub_flavour(child.stem,
                                                            src_stem or default_stem)
-                if lang is None:
-                    lang = "en"
+                lang, leftover = _sub_language(lang, leftover)
                 name = _unique_subtitle(used, default_stem, lang, forced, sdh,
                                         leftover, child.ext, child.name)
                 self._add(plan, child, os.path.join(dest_dir, name),
@@ -538,7 +534,8 @@ class Planner:
                     src_stem = next(c.stem for c in node.children
                                     if c.is_video and _label(c.stem) == owner)
                     lang, forced, sdh, leftover = _sub_flavour(child.stem, src_stem)
-                    name = _unique_subtitle(used, owner, lang or "en", forced, sdh,
+                    lang, leftover = _sub_language(lang, leftover)
+                    name = _unique_subtitle(used, owner, lang, forced, sdh,
                                             leftover, child.ext, child.name)
                     self._add(plan, child, os.path.join(dest_dir, name),
                               f"extra subtitle ({canon})")

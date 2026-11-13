@@ -13,7 +13,8 @@ RELEASE_LEFTOVER = re.compile(
     r"hdtv|aac\d?|ac3|eac3|ddp\d?|dts|yts|yify|rarbg|10bit)\b")
 DUP_SUFFIX = re.compile(r" \((?!\d{4}\))\d+\)\.[A-Za-z0-9]+$")
 EMPTY_SEGMENT = re.compile(r"-\s+-|\s-\s*\.[A-Za-z0-9]+$|\(\s*\)")
-SUB_LANG = re.compile(r"\.[A-Za-z]{2,3}(\.(forced|sdh|cc))?\.[A-Za-z0-9]+$")
+SUB_LANG = re.compile(r"\.([A-Za-z]{2,3})(\.(forced|sdh|cc))?\.[A-Za-z0-9]+$")
+KNOWN_LANG_CODES = set(util.LANG_NAMES.values()) | set(util.ISO_639_2B.values())
 EPISODE = re.compile(r"(.*)/(Season \d+|Specials)/(.*) - S(\d+)E(\d+)")
 
 
@@ -61,9 +62,14 @@ def check(moves, root: str, categories):
         if "  " in base:
             out["double space"].append(rel)
         ext = os.path.splitext(base)[1].lower()
-        if ext in util.SUBTITLE_EXT and not SUB_LANG.search(base) \
+        code = SUB_LANG.search(base) if ext in util.SUBTITLE_EXT else None
+        if ext in util.SUBTITLE_EXT and not code \
                 and os.path.splitext(base)[0] not in extras_stems:
             out["subtitle without a language code"].append(rel)
+        if code and code.group(1).lower() not in KNOWN_LANG_CODES:
+            # taken over from the file's own three-letter tag: right when the tag
+            # is an ISO-639-2 code the table lacks, wrong when it was no language
+            out["subtitle language code this tool does not know"].append(rel)
         if base != base.strip() or base.endswith("."):
             out["leading or trailing whitespace"].append(rel)
 

@@ -180,7 +180,7 @@ LANG_NAMES = {
     "bengali": "bn", "ben": "bn", "bn": "bn",
     "tamil": "ta", "tam": "ta", "ta": "ta",
     "telugu": "te", "tel": "te", "te": "te",
-    "filipino": "fil", "tagalog": "tl", "tgl": "tl", "tl": "tl",
+    "filipino": "fil", "fil": "fil", "tagalog": "tl", "tgl": "tl", "tl": "tl",
 }
 
 # ISO-639-1 -> ISO-639-2/B. Plex accepts either, so the three-letter form is a
@@ -253,15 +253,41 @@ def extract_editions(name: str):
     return re.sub(r"\s+", " ", name).strip(), found
 
 
-def extract_year(name: str):
+def _year_match(name: str):
     """Prefer a parenthesised year, else the last plausible bare year."""
     m = YEAR_PAREN_RE.search(name)
     if m:
-        return int(m.group(1))
-    years = YEAR_RE.findall(name)
-    if years:
-        return int(years[-1])
-    return None
+        return m
+    found = list(YEAR_RE.finditer(name))
+    return found[-1] if found else None
+
+
+def extract_year(name: str):
+    m = _year_match(name)
+    return int(m.group(1)) if m else None
+
+
+def split_at_year(name: str):
+    """Return (what stands before the year, what follows it).
+
+    A release name carries the title up to the year and release information
+    after it, so the title is read from the first half only. Returns
+    (None, None) when there is no year, or nothing but the year in front.
+    """
+    m = _year_match(name)
+    if not m or not any(c.isalnum() for c in name[:m.start()]):
+        return None, None
+    return name[:m.start()], name[m.end():]
+
+
+# A site that signs its uploads in front of the title: "[Site.tld] Title".
+SITE_PREFIX_RE = re.compile(
+    r"^\s*\[\s*(?:www\.)?[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,6}\s*\]\s*[-_.\s]*")
+
+
+def strip_site_prefix(name: str) -> str:
+    stripped = SITE_PREFIX_RE.sub("", name)
+    return stripped if stripped.strip() else name
 
 
 def extract_episode(name: str):

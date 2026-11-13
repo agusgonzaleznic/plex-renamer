@@ -160,7 +160,13 @@ point at a different override directory.
 - **A regional label before the language code** (`Movie (2019).Brazilian.pt.srt`).
   Plex documents only `name.lang.ext`, which would collide when a release ships
   several variants of one language. The label form is widely supported and is the
-  only way to keep the distinction.
+  only way to keep the distinction. It is only used from the third file of a
+  language on: the first two take the two code widths Plex documents, `.pt.srt`
+  and `.por.srt`, so `.eng.srt` beside `.en.srt` is intended.
+- **A three-letter tag the tool does not know is kept as the language code.**
+  Release tools name subtitle files by ISO-639-2 code, so `xyz.srt` becomes
+  `Movie (2019).xyz.srt`, and lint lists every such code. A name with no
+  language in it, or with `und` (undetermined), is filed as English.
 - **One id tag per title.** Plex documents `{imdb-…}`, `{tmdb-…}` and `{tvdb-…}`
   as alternatives, so exactly one is emitted, preferring IMDb.
 

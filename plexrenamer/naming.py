@@ -86,8 +86,6 @@ def episode_marker(season: int, episode: int, episode_end: int | None = None) ->
 def episode_stem(info: TitleInfo, season: int, episode: int,
                  episode_end: int | None = None, ep_title: str | None = None) -> str:
     stem = f"{info.base()} - {episode_marker(season, episode, episode_end)}"
-    if False:
-        pass
     if ep_title:
         clean = util.sanitize(ep_title).strip(" -")
         if clean:
