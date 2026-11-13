@@ -161,6 +161,11 @@ def _split_course_title(rest: str) -> str:
     return " - ".join(parts).strip()
 
 
+def _brackets_only(word: str) -> bool:
+    """A word of brackets and marks with no letter or digit, such as `(]`."""
+    return not util.strip_accents_key(word) and any(c in "()[]{}" for c in word)
+
+
 def _clean_ep_title(rest: str, show_title: str | None = None) -> str:
     rest = util.normalize_separators(rest)
     rest = util.strip_bracket_junk(rest)
@@ -173,6 +178,8 @@ def _clean_ep_title(rest: str, show_title: str | None = None) -> str:
             trimmed = None
             for i in range(len(words), 0, -1):
                 if util.strip_accents_key(" ".join(words[:i])) == show_key:
+                    while i > 1 and _brackets_only(words[i - 1]):
+                        i -= 1      # a bracket after the show's name belongs to the title
                     trimmed = " ".join(words[i:]).strip(" -._")
                     break
             if trimmed is None:
@@ -180,7 +187,7 @@ def _clean_ep_title(rest: str, show_title: str | None = None) -> str:
             rest = trimmed
     rest = re.sub(r"\(\s*(?:19|20)\d{2}\s*\)", " ", rest)
     rest = re.sub(r"(?<![0-9])(?:19|20)\d{2}(?![0-9])", " ", rest)
-    rest = re.sub(r"\s+", " ", rest).strip(" -._()[]{}")
+    rest = util.trim_ends(re.sub(r"\s+", " ", rest))
     if not rest or rest.isdigit() or len(rest) < 2:
         return ""
     if not any(c.isalpha() for c in rest):
