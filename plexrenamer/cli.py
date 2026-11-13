@@ -9,7 +9,7 @@ import os
 import shlex
 import sys
 
-from . import classify, db, decisions, executor, lint, naming, progress, scan, undo
+from . import classify, db, decisions, executor, junk, lint, naming, progress, scan, undo
 from .planner import Planner
 
 CATEGORIES = ["Animated Movies", "Animated Series", "Anime Movies", "Anime Series",
@@ -101,6 +101,8 @@ def cmd_plan(args):
             print("  " + p)
     print()
     findings = lint.report(lint.check(moves, args.root, args.categories))
+    report_junk(*junk.find(args.root, args.categories), args.root,
+                "after the moves, apply deletes these, and the ads the moves hide")
     tsv, review = write_reports(units, plans, moves, args.tag)
     print(f"\nplan written to {tsv}\nunit review written to {review}")
     return 1 if (problems or findings) else 0
@@ -138,8 +140,8 @@ def cmd_apply(args):
     units, plans, _, unmatched = build(args.root, args.categories, args.decisions)
     moves = all_moves(plans)
     if not moves:
-        print("nothing to do")
-        return 0
+        print("nothing to rename")
+        return cmd_clean(args)
     problems = executor.validate(moves)
     if problems and not args.force:
         print(f"refusing to run: {len(problems)} plan problems")
@@ -167,6 +169,8 @@ def cmd_apply(args):
     print(f"measured rate : {rate:.0f} ops/sec on this filesystem")
     print(f"ESTIMATED TIME: {progress.fmt_duration(eta)}")
     if args.dry_run:
+        report_junk(*junk.find(args.root, args.categories), args.root,
+                    "after the moves, these are deleted, and the ads the moves hide")
         print("dry run, nothing changed")
         return 0
     conn = db.connect(args.db)
@@ -176,6 +180,11 @@ def cmd_apply(args):
     print(f"run id        : {run_id}\n")
     ok, failed = run_ops(conn, run_id, "renaming", args.db)
     print(f"\ndone: {ok} operations succeeded, {failed} failed")
+    if failed:
+        print("no junk deleted, because not every operation went through. "
+              "Fix that, then run `clean`.")
+    else:
+        failed += delete_junk(conn, run_id, args)
     unread = report_verify(conn, run_id, "verify", 20, args.db)
     if failed:
         for row in db.run_ops(conn, run_id):
@@ -183,6 +192,64 @@ def cmd_apply(args):
                 print(f"  FAILED {row['kind']} {row['src']} -> {row['dst']}: {row['error']}")
     print(f"\nreverse this run with:  {undo_command(run_id, args.db)}")
     return 0 if not failed and unread is not None else 1
+
+
+def report_junk(found, left, root, heading):
+    """List what is to be deleted, and what is named like it but stays."""
+    rel = lambda p: os.path.relpath(p, root)        # noqa: E731
+    by_reason = {}
+    for j in found:
+        by_reason.setdefault(j.reason, []).append(j)
+    print(f"{heading}: " + (", ".join(f"{len(js)} {r}" for r, js in sorted(by_reason.items()))
+                            or "none"))
+    for j in found[:SHOWN]:
+        print(f"  {j.reason:15} {rel(j.path)}")
+    if len(found) > SHOWN:
+        print(f"  ... and {len(found) - SHOWN} more")
+    for path, why in left[:SHOWN]:
+        print(f"  left in place, {why}: {rel(path)}")
+
+
+def delete_junk(conn, run_id, args) -> int:
+    """After a run's moves, delete the torrent-site ads and .DS_Store files in its
+    categories, as ops of the same run. Returns how many could not be deleted,
+    or 1 when the library could not be looked through."""
+    try:
+        found, left = junk.find(args.root, args.categories)
+    except OSError as exc:
+        print(f"no junk deleted, the library cannot be read right now "
+              f"({type(exc).__name__}: {exc}). Run `clean` later.")
+        return 1
+    report_junk(found, left, args.root, "deleting")
+    if not found:
+        return 0
+    db.append_ops(conn, run_id, junk.ops(found))
+    return run_ops(conn, run_id, "deleting", args.db)[1]
+
+
+def cmd_clean(args):
+    """Delete the torrent-site ads and .DS_Store files, and nothing else."""
+    missing = [c for c in args.categories if not os.path.isdir(os.path.join(args.root, c))]
+    if missing:
+        raise SystemExit(f"category directories not found under {args.root}: {missing}")
+    found, left = junk.find(args.root, args.categories)
+    report_junk(found, left, args.root, "to delete")
+    if not found or args.dry_run:
+        print("dry run, nothing changed" if found else "nothing to delete")
+        return 0
+    conn = db.connect(args.db)
+    run_id = db.create_run(conn, args.root, args.categories, "clean",
+                           args.note or "delete torrent-site ads and .DS_Store files")
+    db.insert_ops(conn, run_id, junk.ops(found))
+    print(f"run id        : {run_id}\n")
+    ok, failed = run_ops(conn, run_id, "deleting", args.db)
+    print(f"\ndeleted {ok} files, {failed} failed")
+    for row in db.run_ops(conn, run_id):
+        if row["status"] == "failed":
+            print(f"  kept {row['src']}: {row['error']}")
+    unread = report_verify(conn, run_id, "verify", 20, args.db)
+    print(f"\nput them back with:  {undo_command(run_id, args.db)}")
+    return 0 if not failed and unread == 0 else 1
 
 
 def report_verify(conn, run_id, label, shown, db_path=None):
@@ -234,7 +301,8 @@ def cmd_undo(args):
           f"{len(rows) - len(expected)} more to check against the disk")
     if args.dry_run:
         for r in expected[:40]:
-            print(f"  {r['kind']}  {r['dst']} -> {r['src']}")
+            print(f"  write back  {r['src']}" if r["kind"] == "delete"
+                  else f"  {r['kind']}  {r['dst']} -> {r['src']}")
         return 0
     try:
         ok, failed = undo.undo_run(conn, run_id)
@@ -408,6 +476,10 @@ def main(argv=None):
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--note", default="")
     p.set_defaults(fn=cmd_prune)
+    p = sub.add_parser("clean")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--note", default="")
+    p.set_defaults(fn=cmd_clean)
     p = sub.add_parser("status"); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("verify"); p.add_argument("--run", type=int); p.set_defaults(fn=cmd_verify)
 

@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from . import db
+from . import db, junk
 from .executor import (METADATA_MOVE, METADATA_RE, NOT_TRIED, PlanError, exists, free_name,
                        inodes_are_stale, is_dir, keep_attributes, located, remove_empty)
 from .progress import Progress
@@ -56,6 +56,13 @@ class _Run:
     # the paths a later run that still stands has not undone, and every folder above them
     held: set = field(default_factory=set)
     around: set = field(default_factory=set)
+    # the bytes of the files this run deleted, by op id
+    kept: dict = field(default_factory=dict)
+    # a path -> [(seq, kept bytes)] of the deletes that took a file from it: of this
+    # run, and, written back by now, of later runs (their seq counts as infinite)
+    deleted: dict = field(default_factory=dict)
+    # the folders above a file this run deleted that could not be written back in this pass
+    waiting: set = field(default_factory=set)
 
 
 def require_library(root: str, categories) -> None:
@@ -77,8 +84,8 @@ def _category(root: str, path: str) -> list:
     return [] if rel.startswith(os.pardir) else [rel.split(os.sep, 1)[0]]
 
 
-def _survey(rows) -> _Run:
-    stale = inodes_are_stale(rows)
+def _survey(rows, rewritten=()) -> _Run:
+    stale = inodes_are_stale(rows, rewritten)
     planned = [r for r in rows if r["reason"] != METADATA_MOVE]
     # Operations run in journal order, and each is marked before it runs. So a
     # row that is marked at all shows the run got at least that far, and the rows
@@ -144,13 +151,25 @@ def undo_run(conn, run_id: int, quiet: bool = False):
     root = run["root"]
     require_library(root, [c for c in (run["categories"] or "").split(",") if c])
     every = db.run_ops(conn, run_id, reverse=True)
+    kept, deleted = db.kept_of_run(conn, run_id), {}
+    for r in every:
+        if r["kind"] == "delete" and r["id"] in kept:
+            deleted.setdefault(r["src"], []).append((r["seq"], kept[r["id"]]))
+    later = set()
+    for other in db.later_runs(conn, run_id, root):
+        theirs = db.kept_of_run(conn, other)
+        for r in db.run_ops(conn, other):
+            if r["kind"] == "delete" and r["status"] == "undone" and r["id"] in theirs:
+                deleted.setdefault(r["src"], []).append((float("inf"), theirs[r["id"]]))
+                later.add(r["src"])
     try:
-        state = _survey(every)
+        state = _survey(every, later)
     except OSError as exc:
         # judged on half a look, the run could be settled by the wrong evidence
         raise VolumeGone(f"the library cannot be read right now "
                          f"({type(exc).__name__}: {exc})") from exc
     _hold_for_later_runs(conn, run_id, root, state)
+    state.kept, state.deleted = kept, deleted
     rows = [r for r in every if r["status"] != "undone"]
     bar = None if quiet else Progress(len(rows), "undo")
     ok = failed = 0
@@ -160,10 +179,13 @@ def undo_run(conn, run_id: int, quiet: bool = False):
             settled = _settle(row, state)
         except Exception as exc:                      # noqa: BLE001
             db.note_op(conn, row["id"], f"undo: {type(exc).__name__}: {exc}")
-            if row["kind"] == "rename":
+            if row["kind"] in ("rename", "delete"):
                 # An older row on one of these paths waits. Settled now, it would
                 # take what this row left there for its own file.
-                state.blocked.update((row["src"], row["dst"]))
+                state.blocked.update(p for p in (row["src"], row["dst"]) if p)
+            if row["kind"] == "delete":
+                # Until the file is back, the folders it goes into stay where they are.
+                state.waiting.update(_folders_above(row["src"]))
             failed += 1
         else:
             if settled:
@@ -185,14 +207,19 @@ def _settle(row, state: _Run) -> bool:
     unproven row turned out not to have happened, so there is nothing to mark.
     Anything that cannot be decided raises, and the row is left for another try.
     """
-    if row["kind"] == "rename" and row["status"] == "failed" \
+    if row["kind"] in ("rename", "delete") and row["status"] == "failed" \
             and (row["error"] or "").startswith(NOT_TRIED):
-        return False                # refused before the rename: the disk never saw it
+        return False                # refused before the call: the disk never saw it
     held = _later_run_on(row, state)
     if held:
         raise PlanError(f"waits for a later run that still stands on {held}: undo it first")
+    if row["kind"] != "delete" and {row["src"], row["dst"]} & state.waiting:
+        raise PlanError("waits for a file this run deleted inside it, which is not written "
+                        "back yet")
     if row["kind"] == "rename":
         return _settle_rename(row, state)
+    if row["kind"] == "delete":
+        return _settle_delete(row, state)
     if row["status"] not in EXPECTED and row["seq"] > state.reached:
         return False                # the run never got as far as this folder
     if row["kind"] == "mkdir":
@@ -214,7 +241,7 @@ def _settle_rename(row, state: _Run) -> bool:
     # journal does not say was carried out.
     blind = state.stale or not row["inode"]
     identified = bool(row["size"]) or not blind
-    at_dst = located(dst, row, state.stale)
+    at_dst = located(dst, row, state.stale) or _written_back(row, state)
     rival = _rival(row, state) if at_dst and blind else None
     if rival is not None and rival["status"] == "undone":
         at_dst, rival = False, None     # what is there is the file that row took back
@@ -253,6 +280,48 @@ def _settle_rename(row, state: _Run) -> bool:
     os.makedirs(os.path.dirname(src), exist_ok=True)
     os.rename(dst, src)
     return True
+
+
+def _settle_delete(row, state: _Run) -> bool:
+    """Write a deleted file back from the bytes the journal kept of it.
+
+    Its bytes go into the journal before the file goes, so a row without them
+    never deleted anything. The file is known by those bytes: where they are at
+    the path, it is back or it never went. Something else at the path is never
+    written over.
+    """
+    path, kept = row["src"], state.kept.get(row["id"])
+    expected = row["status"] in EXPECTED
+    if kept is None:
+        if row["status"] == "done":
+            raise PlanError(f"the journal holds no copy of {path}")
+        if exists(path):
+            return expected             # cut off before it was read: it never went
+        if expected:
+            raise PlanError(f"{path} is gone, and the journal holds no copy of it")
+        return False
+    if junk.same_bytes(path, kept):
+        return expected                 # it is back, or it never went
+    if not is_dir(os.path.dirname(path)):
+        # made or moved by an older row, or by hand: making it again would guess
+        raise PlanError(f"its folder is not there, so it is not written back: "
+                        f"{os.path.dirname(path)}")
+    if exists(path):
+        raise PlanError(f"something else is at {path} now, so it is not written back; "
+                        f"its bytes stay in the journal")
+    junk.restore(path, kept)
+    return True
+
+
+def _written_back(row, state: _Run) -> bool:
+    """Whether the file at a rename's destination is the one a later delete took
+    from there, of this run or of a later run, written back by undo.
+
+    Written back, it has an inode of its own, so its bytes identify it.
+    """
+    return any(seq > row["seq"] and located(row["dst"], row, True)
+               and junk.same_bytes(row["dst"], kept)
+               for seq, kept in state.deleted.get(row["dst"], ()))
 
 
 def _rival(row, state: _Run):

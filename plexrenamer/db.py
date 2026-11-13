@@ -41,6 +41,15 @@ CREATE TABLE IF NOT EXISTS op (
 CREATE UNIQUE INDEX IF NOT EXISTS op_run_seq ON op(run_id, seq);
 CREATE INDEX IF NOT EXISTS op_status ON op(run_id, status);
 
+-- the bytes of a file a delete op removes, written before it goes, for undo
+CREATE TABLE IF NOT EXISTS kept (
+    op_id     INTEGER PRIMARY KEY REFERENCES op(id),
+    sha256    TEXT NOT NULL,
+    mtime_ns  INTEGER,
+    mode      INTEGER,
+    data      BLOB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS idcache (
     key        TEXT PRIMARY KEY,
     provider   TEXT,
@@ -99,6 +108,46 @@ def insert_ops(conn, run_id: int, ops) -> None:
         ],
     )
     conn.commit()
+
+
+def append_ops(conn, run_id: int, ops) -> None:
+    """Add planned ops behind the last op of a run, numbered on from there."""
+    start = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM op WHERE run_id=?",
+                         (run_id,)).fetchone()[0]
+    for i, o in enumerate(ops, 1):
+        o.seq = start + i
+    insert_ops(conn, run_id, ops)
+
+
+def keep_bytes(conn, op_id: int, sha256: str, mtime_ns: int, mode: int, data: bytes) -> None:
+    """Hold the bytes of the file a delete op removes. The caller commits."""
+    conn.execute("INSERT OR REPLACE INTO kept(op_id, sha256, mtime_ns, mode, data)"
+                 " VALUES (?,?,?,?,?)", (op_id, sha256, mtime_ns, mode, sqlite3.Binary(data)))
+
+
+def commit_durably(conn) -> None:
+    """Commit so that the commit survives a power cut. On macOS a plain fsync
+    leaves it in the drive's cache; before a file is deleted, the journal must
+    hold its bytes for good."""
+    conn.execute("PRAGMA fullfsync=ON")
+    try:
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA fullfsync=OFF")
+
+
+def later_runs(conn, run_id: int, root: str):
+    """Every later run on the same library, whatever its status, newest first."""
+    same = os.path.normpath(root)
+    return [row["id"] for row in conn.execute(
+        "SELECT id, root FROM run WHERE id > ? ORDER BY id DESC", (run_id,))
+        if os.path.normpath(row["root"]) == same]
+
+
+def kept_of_run(conn, run_id: int) -> dict:
+    """The kept bytes of a run's delete ops, by op id."""
+    return {r["op_id"]: r for r in conn.execute(
+        "SELECT kept.* FROM kept JOIN op ON op.id = kept.op_id WHERE op.run_id=?", (run_id,))}
 
 
 def append_op(conn, run_id: int, kind: str, src, dst, *, size: int = 0, inode: int = 0,

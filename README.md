@@ -10,9 +10,21 @@ section; the code does not read it. Of its 260 rules, 155 are marked
 
 ## Guarantees
 
-- **Nothing in the library is deleted.** The library is changed with
-  `os.rename`, `os.mkdir`, `os.makedirs` and `os.rmdir` only, and `os.rmdir`
-  only runs on a folder that a listing shows to be empty. A bare `rmdir` is no
+- **Two kinds of file are deleted, and undo writes them back.** These are
+  torrent-site ads (a text, picture, link, page, info or program file whose
+  name starts with the name of a torrent site, such as
+  `YTS.MX - Official site.jpg`) and `.DS_Store` files, known by name and by the
+  first bytes of that format. A poster or an info file named after a release
+  only carries a site's tag, so a name with a year, a resolution, a codec or a
+  source in it is never an ad. Each is a plain
+  file of at most 1 MiB, and its bytes, modification time and mode go into the
+  journal before `os.unlink` removes it, so `undo` writes it back. A file that
+  has changed since it was listed is not deleted. Folders whose names start
+  with `@`, `#` or `.@`, which a NAS keeps for itself, are never looked into.
+- **Nothing else in the library is deleted.** Apart from those two kinds, the
+  library is changed with `os.rename`, `os.mkdir`, `os.makedirs` and `os.rmdir`
+  only, and `os.rmdir` only runs on a folder that a listing shows to be empty.
+  A bare `rmdir` is no
   guard: macOS removes a folder that holds only `._` files, and the files with
   it. On a volume that keeps a folder's attributes in a `._` file beside the
   folder, such as FAT, macOS removes that file with the folder, so a folder with
@@ -21,12 +33,13 @@ section; the code does not read it. Of its 260 rules, 155 are marked
   once they are empty again. The plan clears away a folder the run empties, and
   an empty folder of a title that already has its proper folder. A folder that
   is already at a planned path when the run gets to it is not the run's, and
-  `undo` leaves it. Folder metadata (`.DS_Store`, `Thumbs.db`) is not deleted
-  either: when its folder has to go, it moves up to the parent (as `.DS_Store-1`
-  and so on when the name is taken). A server can keep files of its own hidden
+  `undo` leaves it. When a folder has to go, its folder metadata (`.DS_Store`,
+  `Thumbs.db`) moves up to the parent first (as `.DS_Store-1` and so on when
+  the name is taken). A `.DS_Store` is then deleted with the ads, and a
+  `Thumbs.db` stays. A server can keep files of its own hidden
   from the share, such as thumbnail caches. The tool never sees those, and what
   becomes of them when their folder is removed is up to the server.
-- **The one thing the tool deletes is its own.** To estimate the running time,
+- **Besides those, the one thing the tool deletes is its own.** To estimate the running time,
   `apply` makes a new folder at the volume root (`.plexrenamer-benchmark-` and a
   random suffix), writes 60 scratch files into it, times renaming them and
   removes those files and that folder again, also on `--dry-run`. It removes
@@ -41,7 +54,8 @@ section; the code does not read it. Of its 260 rules, 155 are marked
   over, it stops, changes nothing and says so.
 - **Every run can be undone, also one that was cut off, and also after a remount.**
   The whole plan is in the SQLite journal before the first operation, each rename
-  with the size and inode of its source, and each operation is marked as started
+  with the size and inode of its source, each deleted file with its bytes before
+  it goes, and each operation is marked as started
   before it runs and as done after. `undo` goes through the journal backwards and
   settles every row by where its file is now, found by name, kind and size. That
   way `undo` also reverses an operation that was in flight when the run stopped
@@ -69,7 +83,14 @@ section; the code does not read it. Of its 260 rules, 155 are marked
 - **What undo cannot do.** It cannot bring back what is no longer there: a file
   that was deleted, moved elsewhere or replaced since the run stays as a failed
   row, and the run stays partly undone. So does a folder the run removed whose
-  name something else has taken since: it is not made again. An older run can
+  name something else has taken since: it is not made again. A deleted file is
+  written back only where its path is free: a file there now, such as a
+  `.DS_Store` Finder has written again, stays, and the row waits with the bytes
+  in the journal. Until a deleted file is back, the rows that would move or
+  remove its folder wait too, and a file whose folder is gone is not written
+  back: the folder is not made again. An `undo` that is killed while it writes
+  a file back can leave a `.plexrenamer-restore-` file beside it, which keeps
+  that folder in place until it is removed by hand. An older run can
   then still be undone by naming it with `--run` and adding `--force`; its rows
   on paths the later run still stands on wait until that run is undone. A
   folder's own attributes, such as Finder tags or a comment, go with it when it
@@ -117,7 +138,12 @@ python3 -m plexrenamer undo                       # reverse the newest run that 
 python3 -m plexrenamer undo --run 3               # reverse a specific run
 python3 -m plexrenamer status                     # list runs and their op counts
 python3 -m plexrenamer prune --dry-run            # find shells emptied by a run
+python3 -m plexrenamer clean --dry-run            # list the ads and .DS_Store files
+python3 -m plexrenamer clean                      # delete them, journalled
 ```
+
+`apply` deletes the ads and `.DS_Store` files itself once every move has gone
+through, in the same run, so one `undo` reverses both. `clean` does only that.
 
 Useful flags: `--root` (default `/Volumes/Multimedia`), `--categories` to limit the
 run, `--episode-case lower` to emit `s01e01` instead of `S01E01`, `--decisions` to
@@ -132,8 +158,10 @@ point at a different override directory.
    title, year, database ids, movie/show, editions, or skip.
 4. **planner** turns each title into concrete file moves.
 5. **executor** validates, expands into `mkdir` / `rename` / `rmdir` operations,
-   journals them, runs them with a progress bar, then checks that every file is
-   where the journal says, by name, kind and size.
+   journals them, runs them with a progress bar, deletes the ads and
+   `.DS_Store` files with their bytes in the journal, then checks that every
+   file is where the journal says, by name, kind and size, and that every
+   deleted file is gone.
 6. **undo** settles every journal row against the disk, newest first.
 
 ## Naming applied
@@ -150,7 +178,7 @@ point at a different override directory.
 | Extras | `Behind The Scenes`, `Deleted Scenes`, `Featurettes`, `Interviews`, `Scenes`, `Shorts`, `Trailers`, `Other` |
 | Artwork | `poster.jpg`, `background.jpg` |
 | DVD rip | `Title (Year)/VIDEO_TS/…` kept intact |
-| Junk | dot-prefixed so the scanner skips it, never removed |
+| Junk | dot-prefixed so the scanner skips it; ads and `.DS_Store` files are then deleted |
 
 ## Deliberate deviations from the published examples
 
@@ -195,7 +223,11 @@ is left of it. The look-alike tests do the same with swaps and chains of files
 of one size, folders and empty files, cut off at every step, and undo an older
 run with `--force` while a later run on its paths still stands. The lookup tests
 make single lookups fail where a decision rests on them, and remove folders the
-way macOS does, also on a FAT volume.
+way macOS does, also on a FAT volume. The delete tests check that only ads and
+real `.DS_Store` files go and nothing that changed since the listing, and that
+`undo` writes each one back byte for byte with its time and mode: after a lost
+reply, after a cut on either side of the delete, after a remount, and never
+over a file that has taken its place.
 
 ## Pruning shells left behind by a rename
 
