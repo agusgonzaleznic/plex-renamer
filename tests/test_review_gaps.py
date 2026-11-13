@@ -206,6 +206,9 @@ class MetadataOnUndo(LibraryCase):
     SCENE = test_undo_safety.MetadataNames.SCENE
     EXTRA = test_undo_safety.MetadataNames.EXTRA
 
+    def _journal(self):
+        return test_undo_safety.journal_as_before(self)
+
     def test_metadata_moved_up_does_not_replace_the_parents_own(self):
         parents = os.path.join(self.root, "Movies", ".DS_Store")
         write(parents, "the parent's own metadata")

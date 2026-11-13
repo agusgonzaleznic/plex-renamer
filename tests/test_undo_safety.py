@@ -16,7 +16,7 @@ from unittest import mock
 from test_recovery import Interrupt
 from test_roundtrip import CATS, LibraryCase, dirs, remount, snapshot
 
-from plexrenamer import db, executor, undo
+from plexrenamer import db, executor, planner, undo
 
 MOVIE = "Movies/Loose Movie (1988).mkv"
 MOVIE_DST = "Movies/Loose Movie (1988)/Loose Movie (1988).mkv"
@@ -31,6 +31,20 @@ def write(path, text=FOREIGN):
 def read(path):
     with open(path) as fh:
         return fh.read()
+
+
+def hidden_as_before(name):
+    """The hidden name the planner gave before it stopped calling junk .DS_Store."""
+    if name.strip().lower() in {"ds store", "ds_store"}:
+        return ".DS_Store"
+    return name if name.startswith(".") else "." + name
+
+
+def journal_as_before(case):
+    """Journal the library as the planner did then: journals written before the
+    change hold moves to .DS_Store, and undo has to treat such a file as a file."""
+    with mock.patch.object(planner, "_hidden", hidden_as_before):
+        return LibraryCase._journal(case)
 
 
 class UndoSafety(LibraryCase):
@@ -426,6 +440,9 @@ class MetadataNames(LibraryCase):
 
     SCENE = "Series/Moss.Atlas.2023.S01.1080p.H265-TBK"
     EXTRA = {f"{SCENE}/DS Store": "y"}
+
+    def _journal(self):
+        return journal_as_before(self)
 
     def test_it_is_not_lifted_out_while_its_own_undo_is_blocked(self):
         before, before_dirs = snapshot(self.root), dirs(self.root)

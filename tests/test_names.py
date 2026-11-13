@@ -1,6 +1,7 @@
 """Names that went wrong on real downloads: a language code the table lacked,
-release tags after the year, a site signature in front of the title, and a
-category list that swallowed the command. Every title here is made up."""
+release tags after the year, a site signature in front of the title, a
+category list that swallowed the command, and junk hidden under a name the
+system owns. Every title here is made up."""
 
 from __future__ import annotations
 
@@ -13,7 +14,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plexrenamer import classify, cli, db, executor, lint, scan, util  # noqa: E402
+from plexrenamer import (classify, cli, db, decisions, executor, lint, scan,  # noqa: E402
+                         sidecars, undo, util)
 from plexrenamer.planner import Planner  # noqa: E402
 
 RELEASE = "Movies/Lanternfall (2025) [1080p] [WEBRip] [YTS.MX]"
@@ -144,6 +146,102 @@ class Library(unittest.TestCase):
         _ok, failed = executor.apply_ops(conn, run_id, quiet=True)
         self.assertEqual(failed, 0)
         self.assertEqual(self._moves(), [], "names the tool wrote must read back as final")
+
+
+class HiddenNames(unittest.TestCase):
+    """A dot hides a file from the scanner, but never by giving it a name the
+    system owns: Finder rewrites .DS_Store, macOS removes "._" files with the
+    file or folder of the rest of their name, and file servers often hide both
+    and delete them with their folder."""
+
+    JUNK = ("DS Store", "DS_Store", "_YTS.MX - Official site.jpg", "_read me.txt",
+            "hidden-_read me.txt")
+    HIDDEN_UNIT = "Movies/_Bonus Disc"
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="plexrenamer-hidden-")
+        self.state = tempfile.mkdtemp(prefix="plexrenamer-hidden-state-")
+        names = [f"{RELEASE}/{VIDEO}.mp4"] + [f"{RELEASE}/{j}" for j in self.JUNK] + \
+            [f"{self.HIDDEN_UNIT}/Bonus.mkv"]
+        for n, name in enumerate(names):
+            path = os.path.join(self.root, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(f"file {n}")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.state, ignore_errors=True)
+
+    def _moves(self):
+        trees = scan.scan(self.root, ["Movies"])
+        units = classify.classify_category("Movies", trees["Movies"])
+        units, _, _ = decisions.apply_to(units, {self.HIDDEN_UNIT: {"hide": True}})
+        planner = Planner(self.root)
+        return [m for u in units for m in planner.plan_unit(u).moves]
+
+    def _files(self):
+        out = {}
+        for base, _dirs, files in os.walk(self.root):
+            for name in files:
+                with open(os.path.join(base, name)) as fh:
+                    out[os.path.relpath(os.path.join(base, name), self.root)] = fh.read()
+        return out
+
+    def test_the_names_the_system_owns(self):
+        for name in (".DS_Store", ".ds_store", "._Movie.mkv", "._", "._a\nb"):
+            self.assertTrue(sidecars.SYSTEM_NAME_RE.fullmatch(name), name)
+        for name in (".DS Store", ".DS_Store-1", ".hidden-DS_Store", ".read me.txt", "_x"):
+            self.assertFalse(sidecars.SYSTEM_NAME_RE.fullmatch(name), name)
+
+    def test_a_dot_goes_in_front_unless_it_gives_such_a_name(self):
+        self.assertEqual(sidecars._hidden("read me.txt"), ".read me.txt")
+        self.assertEqual(sidecars._hidden("DS Store"), ".DS Store")
+        self.assertEqual(sidecars._hidden(".already hidden"), ".already hidden")
+        self.assertEqual(sidecars._hidden("DS_Store"), ".hidden-DS_Store")
+        self.assertEqual(sidecars._hidden("ds_store"), ".hidden-ds_store")
+        self.assertEqual(sidecars._hidden("_read me.txt"), ".hidden-_read me.txt")
+        self.assertEqual(sidecars._hidden("_a\nb"), ".hidden-_a\nb")
+
+    def test_two_names_never_share_a_hidden_name(self):
+        names = ("_x", "hıdden-_x", "hidden-hidden-_x", "x", "hidden-x",
+                 "DS_Store", "hidden-DS_Store", "DS Store")
+        for fold in (str.lower, str.upper):     # as a share may compare them
+            hidden = [fold(sidecars._hidden(n)) for n in names]
+            self.assertEqual(len(set(hidden)), len(names), hidden)
+        self.assertEqual(sidecars._hidden("hidden-_x"), ".hidden-hidden-_x")
+        self.assertEqual(sidecars._hidden("Hidden-_x"), ".hidden-Hidden-_x")
+
+    def test_no_planned_path_takes_a_name_the_system_owns(self):
+        moves = self._moves()
+        self.assertEqual(executor.validate(moves), [])
+        planned = {os.path.basename(m.src): os.path.relpath(m.dst, self.root) for m in moves}
+        new = "Movies/Lanternfall (2025)"
+        self.assertEqual(planned["DS Store"], f"{new}/.DS Store")
+        self.assertEqual(planned["DS_Store"], f"{new}/.hidden-DS_Store")
+        self.assertEqual(planned["_YTS.MX - Official site.jpg"],
+                         f"{new}/.hidden-_YTS.MX - Official site.jpg")
+        self.assertEqual(planned["_read me.txt"], f"{new}/.hidden-_read me.txt")
+        self.assertEqual(planned["hidden-_read me.txt"], f"{new}/.hidden-hidden-_read me.txt")
+        self.assertEqual(planned["Bonus.mkv"], "Movies/.hidden-_Bonus Disc/Bonus.mkv")
+        for dst in planned.values():
+            for part in dst.split(os.sep):
+                self.assertFalse(sidecars.SYSTEM_NAME_RE.fullmatch(part), dst)
+
+    def test_hidden_names_read_back_as_final_and_undo_restores_them(self):
+        before = self._files()
+        conn = db.connect(os.path.join(self.state, "j.db"))
+        self.addCleanup(conn.close)
+        run_id = db.create_run(conn, self.root, ["Movies"], "hidden")
+        db.insert_ops(conn, run_id, executor.build_ops(
+            self._moves(), [os.path.join(self.root, "Movies")]))
+        self.assertEqual(executor.apply_ops(conn, run_id, quiet=True)[1], 0)
+        after = self._files()
+        self.assertEqual(sorted(after.values()), sorted(before.values()))
+        self.assertEqual(sum(os.path.basename(p).startswith(".") for p in after), 5)
+        self.assertEqual(self._moves(), [], "a hidden name must read back as final")
+        self.assertEqual(undo.undo_run(conn, run_id, quiet=True)[1], 0)
+        self.assertEqual(self._files(), before)
 
 
 class CommandLine(unittest.TestCase):

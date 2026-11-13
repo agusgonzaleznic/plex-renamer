@@ -175,6 +175,7 @@ class RoundTrip(LibraryCase):
             "Series/Pebble Ridge/Season 01/Pebble Ridge - S01E01.mp4",
             "Series/Wickerby/Season 01/Wickerby - S01E01 - The First One.mkv",
             "Series/Wickerby/Season 01/Wickerby - S01E01 - The First One.en.srt",
+            "Series/Wickerby/.DS Store",
             "Series/Moss Atlas (2023)/Season 01/Moss Atlas (2023) - S01E01.mkv",
             "Classes/Bob - MasterClass - X/Season 01/Bob - MasterClass - X - S01E01 - Introduction.mp4",
         ]:

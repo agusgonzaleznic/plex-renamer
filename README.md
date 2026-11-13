@@ -150,7 +150,7 @@ point at a different override directory.
 | Extras | `Behind The Scenes`, `Deleted Scenes`, `Featurettes`, `Interviews`, `Scenes`, `Shorts`, `Trailers`, `Other` |
 | Artwork | `poster.jpg`, `background.jpg` |
 | DVD rip | `Title (Year)/VIDEO_TS/…` kept intact |
-| Junk | dot-prefixed so the scanner skips it, never removed |
+| Junk | dot-prefixed so the scanner skips it, never removed; `.hidden-` in front where a dot alone gives a name the system owns (`.DS_Store`, `._…`) or the name starts with `hidden-` |
 
 ## Deliberate deviations from the published examples
 

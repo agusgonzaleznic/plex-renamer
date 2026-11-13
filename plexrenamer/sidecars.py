@@ -10,11 +10,25 @@ from . import naming, util
 
 PART_RE = re.compile(r"(?i)[\s._-]+(?:part|pt|cd|disc|disk|dvd)[\s._-]*(\d{1,2})\s*$")
 
+# Dotted names the system owns. Finder writes its own view settings into
+# .DS_Store, macOS takes a "._" file for the attributes of the file or folder
+# of the rest of its name and removes a folder that holds only such files, and
+# file servers often hide both and delete them with their folder.
+SYSTEM_NAME_RE = re.compile(r"(?is)\.(?:ds_store|_.*)")
+
 
 def _hidden(name: str) -> str:
-    if name.strip().lower() in {"ds store", "ds_store"}:
-        return ".DS_Store"
-    return name if name.startswith(".") else "." + name
+    """The name that hides a file or folder from the scanner: a dot in front.
+
+    Where that gives a name the system owns, the file could be lost, so it
+    gets ".hidden-" in front instead. A name that starts with "hidden-" gets
+    it too, or "_x" and "hidden-_x" would both become ".hidden-_x".
+    """
+    if name.startswith("."):
+        return name
+    if SYSTEM_NAME_RE.fullmatch("." + name) or re.match(r"(?i)hidden-", name):
+        return ".hidden-" + name
+    return "." + name
 
 
 def _free_path(path: str) -> str:
