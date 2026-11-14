@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">plex-renamer emblem: a name field with a play mark, a line of text and a text cursor</title>
+  <rect width="256" height="256" rx="56" fill="#1A1D23"/>
+  <rect x="36" y="86" width="184" height="84" rx="20" fill="none" stroke="#FAFAFA" stroke-width="10"/>
+  <path d="M62 112 L62 144 L88 128 Z" fill="#FAFAFA" stroke="#FAFAFA" stroke-width="6" stroke-linejoin="round"/>
+  <rect x="106" y="122" width="60" height="12" rx="6" fill="#FAFAFA"/>
+  <rect x="180" y="104" width="10" height="48" rx="5" fill="#DE3412"/>
+</svg>

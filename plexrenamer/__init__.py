@@ -9,7 +9,7 @@ they are empty again. The speed test removes only the scratch files it wrote
 into a folder of its own.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 
 def console():
