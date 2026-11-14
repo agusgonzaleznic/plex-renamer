@@ -1,7 +1,11 @@
 # Tests on every pull request and every push to main, on macOS, where the tool runs, and the
-# package built as a release builds it. Read-only token; nothing is published. Both run in the
-# shared reusable workflows, pinned to full commit SHAs with the release in a comment; lint.yml
-# proves each pin.
+# package built as a release builds it. Both run in the shared reusable workflows, pinned to full
+# commit SHAs with the release in a comment; lint.yml proves each pin.
+#
+# The merge is the release. On a pull request, "Release / Check the version" fails a change to
+# what ships unless __version__ in plexrenamer/__init__.py is newer than every release. On main,
+# once the tests and the build pass, the Release job tags that version when it is new and runs
+# release.yml on the tag, which publishes to GitHub and PyPI. Nobody pushes a tag by hand.
 
 name: CI
 
@@ -13,13 +17,16 @@ on:
 permissions:
   contents: read
 
+# A pull request cancels its older runs. Runs on main never cancel a running one: it may be
+# tagging a version and waiting for its release.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The job names here are half of the main ruleset's required checks ("Tests / Python 3.12",
-  # "Package build / Build sdist and wheel"): renaming one is a breaking change.
+  # "Package build / Build sdist and wheel", "Release / Check the version"): renaming one is a
+  # breaking change.
   tests:
     name: Tests
     uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/python-tests.yml@6c9eab4c9ab0fb867c1f6d5b71658f71f643b2d7 # v1.8.0
@@ -37,3 +44,39 @@ jobs:
     uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/python-build.yml@6c9eab4c9ab0fb867c1f6d5b71658f71f643b2d7 # v1.8.0
     with:
       build-constraints: requirements/build.txt
+
+  # A change to what users get needs a new version: the package, its metadata, and README.md and
+  # LICENSE, which PyPI shows and the sdist carries. Tests, docs and workflows ship with the next
+  # version. The version is the one the package build read from the built wheel.
+  check-version:
+    name: Release
+    if: github.event_name == 'pull_request'
+    needs: package
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/version-tag.yml@1832ea3171529c36e663d34965917c9f14694ce5 # v1.9.0
+    permissions:
+      contents: read
+    with:
+      version: ${{ needs.package.outputs.version }}
+      release-paths: |
+        plexrenamer/
+        pyproject.toml
+        README.md
+        LICENSE
+
+  # Tags the version on the merge when it is new, then runs release.yml on the tag and waits for
+  # it. A release that fails turns this run red.
+  release:
+    name: Release
+    if: github.event_name == 'push'
+    needs: [tests, package]
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/version-tag.yml@1832ea3171529c36e663d34965917c9f14694ce5 # v1.9.0
+    permissions:
+      contents: write
+      actions: write
+    with:
+      version: ${{ needs.package.outputs.version }}
+      release-paths: |
+        plexrenamer/
+        pyproject.toml
+        README.md
+        LICENSE

@@ -464,10 +464,13 @@ commands and options. It keeps `state/`, `decisions/` and `reports/` in the
 folder you run it from, and git ignores them (apart from
 `reports/plex-spec.json`).
 
-A release is a tag `vX.Y.Z` on main that matches `__version__` in
-`plexrenamer/__init__.py`. Pushing it runs the tests and the package build, then
-publishes the GitHub release with the wheel, the source archive and their
-`SHA256SUMS`, then uploads the same files to PyPI.
+The merge of a pull request is the release. A pull request that changes what
+ships (the `plexrenamer` package, `pyproject.toml`, this README or `LICENSE`)
+raises `__version__` in `plexrenamer/__init__.py`, and its check
+`Release / Check the version` fails until it does. The merge tags `vX.Y.Z` on
+main, runs the tests and the package build again on that tag, publishes the
+GitHub release with the wheel, the source archive and their `SHA256SUMS`, then
+uploads the same files to PyPI. Nobody pushes a tag by hand.
 
 ## License
 
