@@ -33,9 +33,9 @@ any run can be undone, also one that was cut off halfway.
 
 Plex matches a title most reliably when its folder and file names follow the pattern Plex
 publishes. Downloaded files often don't: release tags, dots for spaces, loose files, subtitles
-without a language. plex-renamer reads a library, works out what each folder holds (a movie, a show, or a
-folder of several titles), and moves everything to the Plex names. The renames go through a SQLite
-journal, which is what makes every run reversible.
+without a language. plex-renamer reads a library, works out what each folder holds (a movie, a show,
+or a folder of several titles), and moves everything to the Plex names. The renames go through a
+SQLite journal, which makes every run reversible.
 
 Here is a small made-up library before a run:
 
@@ -74,29 +74,9 @@ Series/
 ```
 
 The loose file got a folder of its own, the release tags are gone, the subtitle got a language
-code, and the old folders were removed once they were empty. The torrent-site ad and the
-`.DS_Store` file were deleted, with a copy of each in the journal. `plex-renamer undo` put all of
-it back exactly as it was.
-
-### How a run goes
-
-```mermaid
-flowchart LR
-    A["plan<br/>changes nothing"] --> B["Read reports/plan.tsv<br/>and plan-units.json"]
-    B --> C{"Is the plan right?"}
-    C -->|no| D["Write a decisions file"]
-    D --> A
-    C -->|yes| E["apply --dry-run"]
-    E --> F["apply"]
-    F --> G["verify"]
-    G --> H["Library in Plex names<br/>and undo reverses it"]
-
-    classDef default fill:#FFFFFF,stroke:#89909F,color:#1A1D23
-    classDef decide fill:#E9EAED,stroke:#555D6D,color:#1A1D23
-    classDef outcome fill:#FFFFFF,stroke:#DE3412,stroke-width:2px,color:#1A1D23
-    class C decide
-    class H outcome
-```
+code, and the old folders were removed once empty. The torrent-site ad and the `.DS_Store` file
+were deleted, with a copy of each in the journal. `plex-renamer undo` put all of it back exactly as
+it was.
 
 ---
 
@@ -107,11 +87,11 @@ Here is what a run promises, and the limits of those promises.
 | Promise or limit | What it means |
 |---|---|
 | **You see the plan first** | `plan` changes nothing in your library. `apply --dry-run` only makes and removes a scratch folder of its own to time the drive. Read the plan before you apply it. |
-| **Nothing is ever overwritten** | A move whose destination is taken stops the run before it starts, unless you pass `--force`. Even then, right before each rename the destination is checked again, and a taken one fails that one move. |
+| **Nothing is ever overwritten** | A move whose destination is taken stops the run before it starts, unless you pass `--force`. Even then, each destination is checked again right before its rename, and a taken one fails that one move. |
 | **Only two kinds of file are deleted** | Torrent-site ads (such as `YTS.MX - Official site.jpg`) and `.DS_Store` files. Each is a small file whose bytes go into the journal before it is deleted, and `undo` writes it back. Everything else in your library is only renamed or moved, and only empty folders are removed. |
 | **Every run can be undone** | Also one that was cut off by Ctrl-C, a kill or a crash, and also after the drive was remounted. `undo` checks each file on disk before it moves it back, and never moves a file onto a path that is taken. |
 | **Run it while nothing else writes to the library** | Nothing locks the library, so pause downloads, syncs and other tools while it runs. |
-| **NAS folders are not all skipped yet** | The files in a folder whose name starts with `@` or `#`, such as Synology's `@eaDir`, are planned to move like any other file. Dot folders such as QNAP's `.@__thumb` are left alone. Read [known limitations](#-known-limitations) before you run it on a NAS. |
+| **NAS folders are not all skipped yet** | Read [known limitations](#-known-limitations) before you run it on a NAS. |
 
 The full list of guarantees, and what undo cannot do, is in
 [Safety guarantees](https://github.com/agusgonzaleznic/plex-renamer/blob/main/docs/safety.md).
@@ -143,24 +123,16 @@ pipx install ./plex_renamer-*.whl
 Each line of the check must end in `OK`. Without the `gh` command, download the three files from
 the release page instead.
 
-Your library needs category folders at the top of the drive. The next section lists them.
-
----
-
-## 📁 Category folders
+### Category folders
 
 The tool changes your library only inside these folders at the top of your drive, apart from the
-scratch folder of its speed test (see step 4 of the first run):
+scratch folder of its speed test (step 4 below):
 
 `Animated Movies`, `Animated Series`, `Anime Movies`, `Anime Series`, `Classes`, `Documentaries`,
 `DocuSeries`, `Movies`, `Music Shows`, `Series`, `StandUp`, `Theatre`
 
-Every category it is asked to work on must exist, so name the ones you have with `--categories`:
-
-```bash
-plex-renamer --root /Volumes/Media --categories Movies Series plan
-plex-renamer --root /Volumes/Media --categories "Animated Movies" Movies plan
-```
+Every category it is asked to work on must exist, so name the ones you have with `--categories`,
+as in `--categories "Animated Movies" Movies`.
 
 ---
 
@@ -169,13 +141,8 @@ plex-renamer --root /Volumes/Media --categories "Animated Movies" Movies plan
 ### 1. Pick a working folder
 
 The journal (`state/plex-renamer.db`), your corrections (`decisions/`) and the reports
-(`reports/`) are kept in the folder you run the command from. Make one folder for this and always
-run from it:
-
-```bash
-mkdir -p ~/plex-renamer-work
-cd ~/plex-renamer-work
-```
+(`reports/`) are kept in the folder you run the command from. Make one folder, such as
+`~/plex-renamer-work`, and always run from it.
 
 Always pass `--root`. Its default, `/Volumes/Multimedia`, is unlikely to be your drive. The options
 `--root`, `--categories`, `--db`, `--decisions` and `--episode-case` go **before** the command
@@ -187,8 +154,8 @@ name; placed after it, they are rejected.
 plex-renamer --root /Volumes/Media --categories Movies Series plan
 ```
 
-This reads the library and changes nothing in it. On the made-up library above it printed (the
-last two lines, with the report paths, left out):
+This reads the library and changes nothing in it. On the made-up library above it printed (report
+paths left out):
 
 ```
 units: 3   file moves: 7
@@ -202,8 +169,8 @@ after the moves, apply deletes these, and the ads the moves hide: 1 .DS_Store fi
   torrent-site ad Movies/The.Quiet.Harbour.2019.1080p.BluRay.x264-GRP/YTS.MX - Official site.jpg
 ```
 
-A "unit" is one title: a movie or a show. `plan` exits with status 1 when it finds a problem in the
-plan or a lint finding, and lists them.
+A "unit" is one title: a movie or a show. `plan` exits with status 1 when it finds a problem in
+the plan or a lint finding, and lists them.
 
 ### 3. Read the reports
 
@@ -215,9 +182,7 @@ plan or a lint finding, and lists them.
 | `plan-units.json` | Every title with what the tool worked out: `kind` (movie or show), `title`, `year`, `ids`, `editions`, `flags`, `notes` and the number of moves. |
 
 A flag marks something to check: `no-year` means no year was found, `loose-file` means a video sat
-loose in the category folder.
-
-If a title, a year or a movie/show call is wrong, correct it with a
+loose in the category folder. If a title, a year or a movie/show call is wrong, correct it with a
 [decisions file](#-correcting-the-tool-with-decisions-files) and run `plan` again.
 
 ### 4. Dry run
@@ -226,17 +191,9 @@ If a title, a year or a movie/show call is wrong, correct it with a
 plex-renamer --root /Volumes/Media --categories Movies Series apply --dry-run
 ```
 
-This counts the operations, measures how fast the drive renames, and estimates the time:
-
-```
-operations    : 14  (mkdir=4, rename=7, rmdir=3)
-measured rate : 26436 ops/sec on this filesystem
-ESTIMATED TIME: 0s
-...
-dry run, nothing changed
-```
-
-To measure the speed it makes a folder named `.plexrenamer-benchmark-...` at the top of the drive,
+This counts the operations, measures how fast the drive renames, and estimates the time
+(14 operations on the made-up library: 4 mkdir, 7 rename and 3 rmdir, ending in `dry run, nothing
+changed`). To measure the speed it makes a folder named `.plexrenamer-benchmark-...` at the top of the drive,
 renames 60 scratch files in it and removes them and the folder again. `--rate` skips that.
 
 ### 5. Apply
@@ -246,8 +203,8 @@ plex-renamer --root /Volumes/Media --categories Movies Series apply
 ```
 
 It renames with a progress bar, deletes the ads and `.DS_Store` files once every move has gone
-through, checks the result, and ends with the command that reverses the run. Shortened, without
-the progress bars, and with the journal path of this example:
+through, checks the result, and ends with the command that reverses the run. Shortened, without the
+progress bars:
 
 ```
 run id        : 1
@@ -267,14 +224,8 @@ plex-renamer --root /Volumes/Media --categories Movies Series verify
 ```
 
 This checks the newest run again: every moved file must be where the journal says, by name, kind
-and size.
-
-```
-run 1: 10 confirmed on disk, 0 mismatched
-```
-
-Check first that the drive is mounted: `verify` doesn't check that yet, and with the drive away it
-reports the moved files as mismatched.
+and size (`run 1: 10 confirmed on disk, 0 mismatched`). Check first that the drive is mounted:
+`verify` doesn't check that yet, and with the drive away it reports the moved files as mismatched.
 
 ### 7. Undo, if you need to
 
@@ -284,22 +235,10 @@ plex-renamer --root /Volumes/Media --categories Movies Series undo
 ```
 
 `undo` reverses the newest run that has not been undone, deleted files included. On the made-up
-library it put back every file with the same name, size, bytes, permissions and modification time:
+library it put back every file with the same name, size, bytes, permissions and modification time
+(`undone: 17 reversed, 0 failed`).
 
-```
-undoing run 1: 17 operations to reverse, 0 more to check against the disk
-undone: 17 reversed, 0 failed
-```
-
-To see every run in the journal and the state it is in:
-
-```bash
-plex-renamer --root /Volumes/Media --categories Movies Series status
-```
-
-```
-run   1  undone                 2026-11-13T22:29:34+00:00  plan=84aa2a09622ab069  {'undone': 17}
-```
+The `status` command lists the last 20 runs in the journal and the state each one is in.
 
 ---
 
@@ -334,11 +273,9 @@ Options that go after the command:
 | `apply` | `--force` | Run even with plan problems or blocking lint findings. Nothing is overwritten even then. |
 | `apply` | `--rate N` | Use N operations per second for the estimate, skip the speed test. |
 | `apply`, `clean`, `prune` | `--note TEXT` | Store a note with the run in the journal. |
-| `undo` | `--run N` | Undo run N. Refused while a later run still stands. |
+| `undo`, `verify` | `--run N` | Act on run N. `undo` refuses while a later run still stands. |
 | `undo` | `--force` | With `--run N`: undo it although a later run still stands. |
-| `undo` | `--dry-run` | List what would be reversed. |
-| `verify` | `--run N` | Check run N instead of the newest. |
-| `clean`, `prune` | `--dry-run` | List what would go, change nothing. |
+| `undo`, `clean`, `prune` | `--dry-run` | List what would be reversed or go, change nothing. |
 
 ---
 
@@ -406,14 +343,13 @@ as a reference, with the source article for each section; the code does not read
   case-insensitively. Uppercase matches what every mainstream tool already uses.
   `--episode-case lower` switches it.
 - **A label before the language code from the third subtitle of one language on.** Plex documents
-  only `name.lang.ext`, which would collide when a release ships several variants of one
-  language. The first two files take the two code widths Plex documents, `.pt.srt` and `.por.srt`,
-  so `.eng.srt` beside `.en.srt` is intended. A third one gets a label: what is left of its old
-  name, as in `Movie (2019).Brazilian.pt.srt`, or else a number, as in `Movie (2019).2.pt.srt`.
+  only `name.lang.ext`, which would collide when a release ships several variants of one language.
+  The first two files take the two code widths Plex documents, `.pt.srt` and `.por.srt`, so
+  `.eng.srt` beside `.en.srt` is intended. A third one gets a label: what is left of its old name,
+  as in `Movie (2019).Brazilian.pt.srt`, or else a number, as in `Movie (2019).2.pt.srt`.
 - **A three-letter tag the tool does not know is kept as the language code.** Release tools name
   subtitle files by ISO-639-2 code, so `xyz.srt` becomes `Movie (2019).xyz.srt`, and `plan` lists
-  every such code. A name with no language in it, or with `und` (undetermined), is filed as
-  English.
+  every such code. A name with no language, or with `und`, is filed as English.
 - **One id tag per title.** Plex documents `{imdb-…}`, `{tmdb-…}` and `{tvdb-…}` as alternatives,
   so exactly one is emitted, preferring IMDb.
 
@@ -426,12 +362,12 @@ as a reference, with the source article for each section; the code does not read
 | `category directories not found under /Volumes/Media: [...]` | The tool was asked to work on category folders your drive does not have. Name the ones you have with `--categories`. |
 | `error: unrecognized arguments: --categories ...` | Options such as `--root` and `--categories` go before the command name: `plex-renamer --root /Volumes/Media --categories Movies plan`. |
 | `no journal at .../state/plex-renamer.db` | You are not in your working folder. `cd` into it, or name the journal with `--db`. |
-| `refusing to run: 1 plan problems` and `destination already occupied: ...` | A file is already where the plan wants to put another one. Look at both, move or rename one of them by hand, or correct the title with a decisions file, then run `plan` again. |
-| `WARNING 1 decision keys matched no unit` | A decisions entry names a path that does not exist. After `apply`, a folder has its new name, so an entry keyed by the old name no longer matches. Update the key, or remove the entry. A second `plan` after a successful `apply` shows `file moves: 0`. |
+| `refusing to run: 1 plan problems` and `destination already occupied: ...` | A file is already where the plan wants to put another one. Look at both, move or rename one by hand, or correct the title with a decisions file, then run `plan` again. |
+| `WARNING 1 decision keys matched no unit` | A decisions entry names a path that does not exist. After `apply` a folder has its new name, so an entry keyed by the old name no longer matches. Update the key, or remove the entry. A second `plan` after a successful `apply` shows `file moves: 0`. |
 | `run 1 is not the newest: run 2 came after it and still stands` | Runs are undone newest first. Undo run 2 first (plain `undo` picks it), then run 1. `undo --run 1 --force` exists, but read the [Safety guarantees](https://github.com/agusgonzaleznic/plex-renamer/blob/main/docs/safety.md) before you use it. |
 | `undone: 16 reversed, 1 failed` with `still holds other entries, kept` | Something was added to a folder the run created. Undo keeps that folder rather than remove what is not its own. Move the new file out, then run `undo` again; it finishes the rows that are left. |
 | `stopped: /Volumes/Media is not there` | The drive is not mounted. Undo changes nothing. Mount it and run `undo` again. |
-| `run 1: 0 confirmed on disk, 10 mismatched` with `missing destination: ...` | Check that the drive is mounted: `verify` does not check that first, so with the drive away every moved file reads as missing. |
+| `run 1: 0 confirmed on disk, 10 mismatched` with `missing destination: ...` | The drive is probably not mounted: `verify` does not check that first. |
 
 ---
 
@@ -451,7 +387,6 @@ as a reference, with the source article for each section; the code does not read
   files as mismatched. `undo` checks, and stops.
 - **It never looks a title up online.** Years and ids come from the folder and file names and from
   your decisions files.
-- **Tested on macOS only.**
 
 ---
 
@@ -459,8 +394,7 @@ as a reference, with the source article for each section; the code does not read
 
 Issues and pull requests are welcome at
 [github.com/agusgonzaleznic/plex-renamer](https://github.com/agusgonzaleznic/plex-renamer). Please
-read the
-[contributing guide](https://github.com/agusgonzaleznic/.github/blob/main/CONTRIBUTING.md)
+read the [contributing guide](https://github.com/agusgonzaleznic/.github/blob/main/CONTRIBUTING.md)
 first.
 
 Run the tests from a clone:
@@ -470,9 +404,8 @@ python3 -m unittest discover -s tests -v
 ```
 
 They cover the naming patterns, plan validation, the apply and undo round trip byte for byte, runs
-cut off at every single step, other files put in the way, a library that disappears, a lost reply
-from a network share, and the inode numbers network shares hand out. CI runs them on macOS, on
-Python 3.12 to 3.15, for every pull request and every push to main.
+cut off at every single step, a library that disappears and network-share quirks. CI runs them on
+macOS, on Python 3.12 to 3.15, for every pull request and every push to main.
 
 From a clone, `python3 -m plexrenamer` runs the code in place, with the same commands and options.
 It keeps `state/`, `decisions/` and `reports/` in the folder you run it from, and git ignores them
@@ -500,14 +433,10 @@ flowchart TD
     class I outcome
 ```
 
-- A pull request that changes what ships (the `plexrenamer` package, `pyproject.toml`, this README
-  or `LICENSE`) raises `__version__` in `plexrenamer/__init__.py`, and its check
-  `Release / Check the version` fails until it does. Tests, docs and workflows ship with the next
-  version.
-- The merge tags `vX.Y.Z` on main, runs the tests and the package build again on that tag,
-  publishes the GitHub release with the wheel, the source archive and their `SHA256SUMS`, then
-  uploads the same files to PyPI.
-- The PyPI upload uses Trusted Publishing, so the workflow uses no PyPI token.
+A pull request that changes what ships raises `__version__` in `plexrenamer/__init__.py`, and its
+check `Release / Check the version` fails until it does. Tests, docs and workflows ship with the
+next version. The release publishes the wheel, the source archive and their `SHA256SUMS` on GitHub,
+then uploads the same files to PyPI with Trusted Publishing, so the workflow uses no PyPI token.
 
 ---
 
