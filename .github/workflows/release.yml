@@ -1,8 +1,10 @@
-# Releases plex-renamer from a version tag vX.Y.Z on main. The tests and the package build run
-# first; then the GitHub release is published with the built files and their SHA256SUMS, from
-# the trunk only; then the same files go to PyPI through Trusted Publishing. PyPI trusts this
-# file (release.yml) running in the GitHub environment pypi, which accepts only v* tags, so the
-# workflow uses no PyPI token.
+# Releases plex-renamer from a version tag vX.Y.Z on main. ci.yml's Release job makes the tag
+# when a merge brings a new version, and starts this workflow on it with workflow_dispatch,
+# because GitHub starts no workflow for a tag its own token pushes. The tests and the package
+# build run first; then the GitHub release is published with the built files and their
+# SHA256SUMS, from the trunk only; then the same files go to PyPI through Trusted Publishing. PyPI
+# trusts this file (release.yml) running in the GitHub environment pypi, which accepts only v*
+# tags, so the workflow uses no PyPI token.
 #
 # Tests, build and GitHub release run in the shared reusable workflows. The upload has to stay in
 # this file: PyPI only trusts a job defined in the workflow file registered with it, never one
@@ -15,11 +17,12 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
 
 permissions: {}
 
-# One release at a time: a tag pushed while a release runs waits for it. GitHub keeps only the
-# newest waiting run of a group and cancels an older one, so push one tag at a time.
+# One release at a time. GitHub keeps only the newest waiting run of a group and cancels an older
+# one; ci.yml starts one release and waits for it before the next.
 concurrency:
   group: release
   cancel-in-progress: false
