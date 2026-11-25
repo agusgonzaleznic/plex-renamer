@@ -52,7 +52,7 @@ jobs:
     name: Release
     if: github.event_name == 'pull_request'
     needs: package
-    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/version-tag.yml@1832ea3171529c36e663d34965917c9f14694ce5 # v1.9.0
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/version-tag.yml@973ef56b7c5ef15c5cdb694ae8d57ba7929539bd # v1.11.0
     permissions:
       contents: read
     with:
@@ -69,7 +69,7 @@ jobs:
     name: Release
     if: github.event_name == 'push'
     needs: [tests, package]
-    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/version-tag.yml@1832ea3171529c36e663d34965917c9f14694ce5 # v1.9.0
+    uses: agusgonzaleznic/github-reusable-workflows/.github/workflows/version-tag.yml@973ef56b7c5ef15c5cdb694ae8d57ba7929539bd # v1.11.0
     permissions:
       contents: write
       actions: write
